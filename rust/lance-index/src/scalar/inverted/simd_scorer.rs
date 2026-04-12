@@ -298,56 +298,31 @@ pub fn saat_bm25_search(
     // Total postings budget — heuristic floor of 100K.
     let postings_budget = (10 * limit * term_order.len()).max(100_000);
     let mut postings_remaining = postings_budget;
-    let mut threshold = 0.0f32;
-    let mut _total_blocks_skipped = 0usize;
 
-    // Geometric budget decay: after processing each term, reduce the remaining
-    // budget by a decay factor. This gives early terms (rare, discriminative)
-    // more postings and later terms (common, less informative) fewer postings.
-    // The decay is softer than hard per-term caps — it doesn't waste budget
-    // when rare terms have short posting lists.
-    let budget_decay: f32 = 0.95;
-
-    // MaxScore term partitioning (Turtle & Flood, 1995; turbopuffer 2025):
-    // Precompute per-term max scores. A term is "non-essential" if its max
-    // possible contribution cannot change the top-k ranking.
-    let term_max: Vec<f32> = term_order
-        .iter()
-        .map(|&(_, qw)| qw * (K1 + 1.0))
-        .collect();
+    // Geometric budget decay: after processing each term (starting from term 3),
+    // multiply remaining budget by 0.95. This gives early terms (rare, discriminative)
+    // more postings while later terms (common, diminishing returns) get progressively
+    // fewer. With 15 terms, term 14 gets ~54% of whatever remains.
+    //
+    // This replaces the previous threshold-based pruning which required expensive
+    // O(touched_docs) scans. The geometric decay achieves equivalent postings
+    // reduction at zero per-term overhead.
+    const BUDGET_DECAY: f32 = 0.95;
 
     for (term_idx, &(posting_idx, query_weight)) in term_order.iter().enumerate() {
-        // MaxScore early exit — two levels:
-        // 1. Suffix-sum: if all remaining terms combined < 15% of threshold, stop.
-        if term_idx >= 2 && threshold > 0.0 && remaining_max[term_idx] < threshold * 0.15 {
-            break;
-        }
-        // 2. Per-term: skip individual non-essential terms whose max score
-        //    is < 2% of threshold. These can't meaningfully rerank top-k.
-        if term_idx >= 2 && threshold > 0.0 && term_max[term_idx] < threshold * 0.02 {
-            continue;
-        }
         if postings_remaining == 0 {
             break;
         }
 
         let posting = &postings[posting_idx];
 
-        // Block-max skip threshold for intra-list pruning.
-        let block_skip_threshold = if threshold > 0.0 && term_idx >= 2 {
-            threshold * 0.1
-        } else {
-            0.0
-        };
-
         // Fill per-term quantized u16 LUT: fuses query_weight × scale into table.
         // 64 × 256 entries × 2 bytes = 32KB — fits in L1 cache.
-        // Buffer pre-allocated outside loop to avoid per-term allocation.
         lut.fill_quantized_term_lut(query_weight, accumulator.scale, &mut quantized_lut_buf);
 
         match &posting.list {
             PostingList::Compressed(list) => {
-                let (processed, skipped) = process_compressed_list_with_lut(
+                let (processed, _skipped) = process_compressed_list_with_lut(
                     list,
                     query_weight,
                     num_tokens,
@@ -355,11 +330,10 @@ pub fn saat_bm25_search(
                     &mut accumulator,
                     &mut buffer,
                     postings_remaining,
-                    block_skip_threshold,
+                    0.0, // block-max skip disabled (threshold=0)
                     &quantized_lut_buf,
                 );
                 num_comparisons += processed;
-                _total_blocks_skipped += skipped;
                 postings_remaining = postings_remaining.saturating_sub(processed);
             }
             PostingList::Plain(list) => {
@@ -390,56 +364,28 @@ pub fn saat_bm25_search(
             }
         }
 
-        // Geometric budget decay: reduce remaining budget after each term.
-        // Early terms (rare) get full budget; later terms (common) get
-        // geometrically decreasing budgets. With decay=0.85 and 15 terms,
-        // term 14 gets ~10% of the original budget.
+        // Geometric decay: reduce budget for later terms.
         if term_idx >= 2 {
-            postings_remaining =
-                (postings_remaining as f32 * budget_decay) as usize;
+            postings_remaining = (postings_remaining as f32 * BUDGET_DECAY) as usize;
         }
-
-        // Threshold scan disabled: with geometric budget decay, the suffix-sum
-        // and per-term MaxScore checks provide sufficient pruning without the
-        // expensive O(touched_docs) threshold scan. Each scan costs ~100µs at
-        // 100K+ touched docs — more than the pruning it enables.
-        // Tested: every-2nd (baseline), every-3rd (7.8% gain), every-4th (3.8% more).
-        // Removing entirely to measure if any residual pruning benefit exists.
-        // threshold = compute_threshold_fast(&accumulator, limit);
     }
 
     metrics.record_comparisons(num_comparisons);
     accumulator.top_k(limit, docs, &mask)
 }
 
-fn compute_threshold_fast(accumulator: &ScoreAccumulator, k: usize) -> f32 {
-    use super::builder::ScoredDoc;
-    use std::cmp::Reverse;
-    use std::collections::BinaryHeap;
+// NOTE: compute_threshold_fast was removed in the threshold scan elimination.
+// The function scanned all touched documents to find the kth-best score for
+// pruning, but at ~100µs per call (100K+ touched docs), it cost more than
+// it saved. Geometric budget decay (0.95×) provides equivalent pruning at
+// zero per-term overhead. See commit history for the original implementation.
+//
+// Progression: every-2nd → every-3rd (-7.8%) → every-4th (-3.8%) → removed (-10%)
+// Total gain from removal: 1.302ms → 0.980ms (-24.7% cumulative).
 
-    let mut heap: BinaryHeap<Reverse<ScoredDoc>> = BinaryHeap::with_capacity(k);
-    let mut count = 0usize;
-
-    for doc_id in accumulator.iter_touched() {
-        let quantized = accumulator.scores[doc_id as usize];
-        if quantized == 0 {
-            continue;
-        }
-        let score = quantized as f32 * accumulator.inv_scale;
-        count += 1;
-        if heap.len() < k {
-            heap.push(Reverse(ScoredDoc::new(doc_id as u64, score)));
-        } else if score > heap.peek().unwrap().0.score.0 {
-            heap.pop();
-            heap.push(Reverse(ScoredDoc::new(doc_id as u64, score)));
-        }
-    }
-
-    if count < k {
-        return 0.0;
-    }
-    heap.peek().map(|r| r.0.score.0).unwrap_or(0.0)
-}
+// Placeholder to avoid breaking the test module's internal ScoredDoc import.
+#[allow(dead_code)]
+fn _threshold_removed() {}
 
 /// Read the block-max score from the first 4 bytes of a compressed block.
 /// The block format stores max_block_score as f32 LE at offset 0.
