@@ -77,30 +77,43 @@ impl PrecomputedDocNorms {
 ///
 /// Uses a parallel `touched` bitset to avoid branch mispredictions in the hot loop.
 /// The bitset check + score addition are branchless operations.
+/// Dense score accumulator using u16 quantized scores.
+///
+/// Key insight from Mackenzie et al. (TOIS 2023): narrower accumulators give
+/// dramatic speedups from cache density — 2x more accumulators per cache line.
+/// u16: 1M docs = 2MB (fits L2 cache), vs f32: 4MB (spills to L3).
+///
+/// Per-query dynamic rescaling: map [0, max_possible_score] → [0, 65000]
+/// to avoid overflow while maximizing precision.
 struct ScoreAccumulator {
-    scores: Vec<f32>,
-    /// Bitset: 1 bit per doc to track which docs have been scored.
-    /// Used for efficient top-k extraction without scanning entire score array.
+    scores: Vec<u16>,
     touched_bits: Vec<u64>,
     num_docs: usize,
+    /// Scale: f32_score * scale → u16 quantized
+    scale: f32,
+    /// Inverse: u16 quantized * inv_scale → f32_score
+    inv_scale: f32,
 }
 
 impl ScoreAccumulator {
-    fn new(num_docs: usize) -> Self {
+    fn new(num_docs: usize, max_possible_score: f32) -> Self {
         let num_words = (num_docs + 63) / 64;
+        let scale = if max_possible_score > 0.0 {
+            65000.0 / max_possible_score
+        } else {
+            1.0
+        };
         Self {
-            scores: vec![0.0f32; num_docs],
+            scores: vec![0u16; num_docs],
             touched_bits: vec![0u64; num_words],
             num_docs,
+            scale,
+            inv_scale: 1.0 / scale,
         }
     }
 
-    /// Batch-accumulate scores for a block of documents.
-    /// Uses precomputed doc_norms to eliminate redundant per-term computation.
-    /// The inner loop is structured for auto-vectorization:
-    /// - 8-wide processing
-    /// - No branches in the hot path (bitset set is branchless)
-    /// - Contiguous memory access for scores
+    /// Batch-accumulate quantized scores for a block of documents.
+    /// u16 additions are cheaper than f32 and pack 2x denser in cache lines.
     #[inline]
     fn accumulate_block(
         &mut self,
@@ -111,23 +124,10 @@ impl ScoreAccumulator {
     ) {
         let len = doc_ids.len();
         let chunks = len / 8;
+        let scale = self.scale;
 
-        // Hot loop: 8-wide scoring with precomputed norms.
-        // Prefetch the next chunk's doc_norms and scores to hide memory latency.
         for chunk in 0..chunks {
             let base = chunk * 8;
-
-            // Software prefetch: touch the next chunk's cache lines
-            if chunk + 1 < chunks {
-                let next_doc = unsafe { *doc_ids.get_unchecked((chunk + 1) * 8) } as usize;
-                unsafe {
-                    // Load into register to trigger hardware prefetch
-                    let _ = std::ptr::read_volatile(
-                        doc_norms.norms.as_ptr().add(next_doc)
-                    );
-                }
-            }
-
             for i in 0..8 {
                 let idx = base + i;
                 let doc_id = unsafe { *doc_ids.get_unchecked(idx) };
@@ -135,10 +135,12 @@ impl ScoreAccumulator {
                 let doc_norm = doc_norms.get(doc_id);
 
                 let score = query_weight_times_k1_plus_1 * freq / (freq + doc_norm);
+                let quantized = (score * scale) as u16;
 
                 let score_idx = doc_id as usize;
                 unsafe {
-                    *self.scores.get_unchecked_mut(score_idx) += score;
+                    let current = *self.scores.get_unchecked(score_idx);
+                    *self.scores.get_unchecked_mut(score_idx) = current.saturating_add(quantized);
                 }
 
                 let word_idx = (doc_id >> 6) as usize;
@@ -149,17 +151,17 @@ impl ScoreAccumulator {
             }
         }
 
-        // Remainder
         for idx in (chunks * 8)..len {
             let doc_id = doc_ids[idx];
             let freq = freqs[idx] as f32;
             let doc_norm = doc_norms.get(doc_id);
             let score = query_weight_times_k1_plus_1 * freq / (freq + doc_norm);
+            let quantized = (score * scale) as u16;
 
-            self.scores[doc_id as usize] += score;
+            let score_idx = doc_id as usize;
+            self.scores[score_idx] = self.scores[score_idx].saturating_add(quantized);
             let word_idx = (doc_id >> 6) as usize;
-            let bit = 1u64 << (doc_id & 63);
-            self.touched_bits[word_idx] |= bit;
+            self.touched_bits[word_idx] |= 1u64 << (doc_id & 63);
         }
     }
 
@@ -175,7 +177,7 @@ impl ScoreAccumulator {
             .take_while(move |&doc_id| (doc_id as usize) < self.num_docs)
     }
 
-    /// Extract top-k results from the accumulator.
+    /// Extract top-k results. Dequantize u16 → f32 using inv_scale.
     fn top_k(&self, k: usize, docs: &DocSet, mask: &RowAddrMask) -> Vec<DocCandidate> {
         if k == 0 {
             return Vec::new();
@@ -188,10 +190,11 @@ impl ScoreAccumulator {
         let mut heap: BinaryHeap<Reverse<ScoredDoc>> = BinaryHeap::with_capacity(k);
 
         for doc_id in self.iter_touched() {
-            let score = self.scores[doc_id as usize];
-            if score <= 0.0 {
+            let quantized = self.scores[doc_id as usize];
+            if quantized == 0 {
                 continue;
             }
+            let score = quantized as f32 * self.inv_scale;
 
             let row_id = docs.row_id(doc_id);
             if !mask.selected(row_id) {
@@ -294,7 +297,9 @@ pub fn saat_bm25_search(
         remaining_max[i] = remaining_max[i + 1] + term_order[i].1 * (K1 + 1.0);
     }
 
-    let mut accumulator = ScoreAccumulator::new(num_docs);
+    // max_possible_score = sum of all terms' max contributions (used for u16 scaling)
+    let max_possible_score = remaining_max[0]; // sum of all qw * (K1+1)
+    let mut accumulator = ScoreAccumulator::new(num_docs, max_possible_score);
     let mut buffer = DecodeBuffer::new();
     let mut num_comparisons = 0usize;
 
@@ -315,12 +320,15 @@ pub fn saat_bm25_search(
                 );
             }
             PostingList::Plain(list) => {
+                let scale = accumulator.scale;
                 for i in 0..list.row_ids.len() {
                     let row_id = list.row_ids[i] as u32;
                     let freq = list.frequencies[i] as f32;
                     let doc_norm = doc_norms.get(row_id);
                     let score = qw_k1p1 * freq / (freq + doc_norm);
-                    accumulator.scores[row_id as usize] += score;
+                    let quantized = (score * scale) as u16;
+                    let idx = row_id as usize;
+                    accumulator.scores[idx] = accumulator.scores[idx].saturating_add(quantized);
                     let word_idx = (row_id >> 6) as usize;
                     accumulator.touched_bits[word_idx] |= 1u64 << (row_id & 63);
                     num_comparisons += 1;
@@ -369,7 +377,7 @@ pub fn saat_bm25_search_parallel(
         .par_iter()
         .map(|&(ref list, qw_k1p1)| {
             let doc_norms = &doc_norms;
-            let mut acc = ScoreAccumulator::new(num_docs);
+            let mut acc = ScoreAccumulator::new(num_docs, qw_k1p1);
             let mut buffer = DecodeBuffer::new();
 
             match list {
@@ -382,7 +390,8 @@ pub fn saat_bm25_search_parallel(
                         let freq = plist.frequencies[i] as f32;
                         let doc_norm = doc_norms.get(doc_id);
                         let score = qw_k1p1 * freq / (freq + doc_norm);
-                        acc.scores[doc_id as usize] += score;
+                        let quantized = (score * acc.scale) as u16;
+                        acc.scores[doc_id as usize] = acc.scores[doc_id as usize].saturating_add(quantized);
                         acc.touched_bits[(doc_id >> 6) as usize] |= 1u64 << (doc_id & 63);
                     }
                 }
@@ -392,13 +401,15 @@ pub fn saat_bm25_search_parallel(
         .collect();
 
     // Merge accumulators: add score arrays and OR touched bitsets
-    let mut accumulator = ScoreAccumulator::new(num_docs);
+    let max_possible_score: f32 = terms.iter().map(|(_, qw)| *qw).sum();
+    let mut accumulator = ScoreAccumulator::new(num_docs, max_possible_score);
     let mut total_comparisons = 0usize;
     for partial in &partial_accumulators {
-        // Merge scores — SIMD-friendly contiguous array addition
         for i in 0..num_docs {
             unsafe {
-                *accumulator.scores.get_unchecked_mut(i) += *partial.scores.get_unchecked(i);
+                let current = *accumulator.scores.get_unchecked(i);
+                let additional = *partial.scores.get_unchecked(i);
+                *accumulator.scores.get_unchecked_mut(i) = current.saturating_add(additional);
             }
         }
         // Merge touched bitsets
@@ -424,10 +435,11 @@ fn compute_threshold_fast(accumulator: &ScoreAccumulator, k: usize) -> f32 {
     let mut count = 0usize;
 
     for doc_id in accumulator.iter_touched() {
-        let score = accumulator.scores[doc_id as usize];
-        if score <= 0.0 {
+        let quantized = accumulator.scores[doc_id as usize];
+        if quantized == 0 {
             continue;
         }
+        let score = quantized as f32 * accumulator.inv_scale;
         count += 1;
         if heap.len() < k {
             heap.push(Reverse(ScoredDoc::new(doc_id as u64, score)));
