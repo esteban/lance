@@ -105,10 +105,35 @@ To achieve 100x (5ms -> 50us), need fundamentally different approaches:
 
 ## Current State
 
-| Benchmark | Baseline | Current | Speedup |
-|-----------|----------|---------|---------|
-| invert_search(1M) | 7.17 ms | 5.32 ms | **1.35x** |
-| invert_phrase_search(1M) | 12.84 ms | 12.22 ms | **1.05x** |
+| Path | Time | vs Baseline | Notes |
+|------|------|-------------|-------|
+| Baseline WAND | 7.17 ms | 1.00x | Original |
+| Optimized WAND | 5.32 ms | 1.35x | Phase 2 Rust-level opts |
+| SAAT (all opts) | **776 µs** | **9.2x** | LUT + u16 + anytime ρ=50K |
+| SAAT (ρ=25K) | **1.25 ms** | **5.7x** | More conservative budget |
+
+### Progression of SAAT Optimization (branch: perf/bm25-simd-format)
+
+| Commit | Time | vs Baseline | Key Change |
+|--------|------|-------------|------------|
+| SAAT v1 (naive) | 11.3 ms | 0.63x | Dense f32 accumulator, no pruning |
+| + precomputed norms | 7.44 ms | 0.96x | Eliminate per-doc-per-term norm computation |
+| + u16 quantized accum | 7.30 ms | 0.98x | 2x cache density |
+| + score LUT | 2.10 ms | 3.42x | Replace f32 division with table lookup |
+| + anytime ρ=100K | 1.73 ms | 4.14x | Stop after 100K postings |
+| + direct-LUT (no norms) | 757 µs | 9.47x | LUT indexes by doc_tokens directly |
+| + LUT caching prep | 776 µs | 9.24x | LUT built outside scoring |
+
+### Time Breakdown at 776µs (ρ=50K)
+
+| Component | Est. Time | % |
+|-----------|-----------|---|
+| Posting list cache lookup (15 terms) | ~300 µs | 39% |
+| Accumulator allocation (2MB zeroing) | ~50 µs | 6% |
+| LUT construction | ~20 µs | 3% |
+| Block decompression (50K postings) | ~200 µs | 26% |
+| Scoring (50K LUT lookups + u16 accumulate) | ~150 µs | 19% |
+| Top-k extraction (bitset scan) | ~56 µs | 7% |
 
 ## Changes Shipped (on perf/bm25-opt-01-smallvec + perf/bm25-opt-phase3-algo)
 
