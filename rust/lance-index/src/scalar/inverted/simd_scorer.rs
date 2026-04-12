@@ -49,7 +49,6 @@ pub(crate) struct ScoreLookupTable {
 const NUM_DL_BUCKETS: usize = 256;
 
 impl ScoreLookupTable {
-
     pub(crate) fn new(docs: &DocSet) -> Self {
         let num_tokens = docs.num_tokens_slice();
         let avgdl = docs.average_length();
@@ -70,7 +69,12 @@ impl ScoreLookupTable {
             }
         }
 
-        Self { table, dl_scale, num_dl_buckets: NUM_DL_BUCKETS, avgdl }
+        Self {
+            table,
+            dl_scale,
+            num_dl_buckets: NUM_DL_BUCKETS,
+            avgdl,
+        }
     }
 
     #[inline(always)]
@@ -220,7 +224,7 @@ impl ScoreAccumulator {
             let freq = freqs[idx] as f32;
             let doc_tokens = num_tokens[doc_id as usize];
             let doc_norm = K1 * (1.0 - B + b_over_avgdl * doc_tokens as f32);
-                let score = query_weight_times_k1_plus_1 * freq / (freq + doc_norm);
+            let score = query_weight_times_k1_plus_1 * freq / (freq + doc_norm);
             let quantized = (score * scale) as u16;
 
             let score_idx = doc_id as usize;
@@ -404,14 +408,17 @@ pub fn saat_bm25_search(
                 let scale = accumulator.scale;
                 let to_process = list.row_ids.len().min(postings_remaining);
                 for i in 0..to_process {
-                    let row_id = list.row_ids[i] as u32;
+                    let row_id = list.row_ids[i];
+                    let Some(doc_id) = docs.doc_index_by_row_id(row_id) else {
+                        continue;
+                    };
                     let freq = list.frequencies[i] as u32;
-                    let doc_tokens = num_tokens[row_id as usize];
-                    let score = lut.score(freq, doc_tokens, query_weight * (K1 + 1.0));
+                    let doc_tokens = num_tokens[doc_id as usize];
+                    let score = lut.score(freq, doc_tokens, query_weight);
                     let quantized = (score * scale) as u16;
-                    let idx = row_id as usize;
+                    let idx = doc_id as usize;
                     accumulator.scores[idx] = accumulator.scores[idx].saturating_add(quantized);
-                    accumulator.touched_bits[(row_id >> 6) as usize] |= 1u64 << (row_id & 63);
+                    accumulator.touched_bits[(doc_id >> 6) as usize] |= 1u64 << (doc_id & 63);
                 }
                 num_comparisons += to_process;
                 postings_remaining = postings_remaining.saturating_sub(to_process);
@@ -485,13 +492,18 @@ fn process_compressed_list_with_lut(
             let remainder = length % BLOCK_SIZE;
             if bi + 1 == num_blocks && remainder != 0 {
                 decompress_posting_remainder(
-                    block_data, remainder, list.posting_tail_codec,
-                    &mut buffer.doc_ids, &mut buffer.freqs,
+                    block_data,
+                    remainder,
+                    list.posting_tail_codec,
+                    &mut buffer.doc_ids,
+                    &mut buffer.freqs,
                 );
             } else {
                 decompress_posting_block(
-                    block_data, &mut buffer.scratch,
-                    &mut buffer.doc_ids, &mut buffer.freqs,
+                    block_data,
+                    &mut buffer.scratch,
+                    &mut buffer.doc_ids,
+                    &mut buffer.freqs,
                 );
             }
         }
@@ -512,9 +524,11 @@ fn process_compressed_list_with_lut(
                 let score_idx = doc_id as usize;
                 unsafe {
                     let current = *accumulator.scores.get_unchecked(score_idx);
-                    *accumulator.scores.get_unchecked_mut(score_idx) = current.saturating_add(quantized);
-                    *accumulator.touched_bits.get_unchecked_mut((doc_id >> 6) as usize) |=
-                        1u64 << (doc_id & 63);
+                    *accumulator.scores.get_unchecked_mut(score_idx) =
+                        current.saturating_add(quantized);
+                    *accumulator
+                        .touched_bits
+                        .get_unchecked_mut((doc_id >> 6) as usize) |= 1u64 << (doc_id & 63);
                 }
             }
         }
@@ -576,13 +590,7 @@ fn process_compressed_list(
 
         *num_comparisons += buffer.doc_ids.len();
 
-        accumulator.accumulate_block(
-            &buffer.doc_ids,
-            &buffer.freqs,
-            qw_k1p1,
-            num_tokens,
-            0.0,
-        );
+        accumulator.accumulate_block(&buffer.doc_ids, &buffer.freqs, qw_k1p1, num_tokens, 0.0);
 
         block_idx = batch_end;
     }
@@ -592,13 +600,22 @@ fn process_compressed_list(
 mod tests {
     use super::*;
     use crate::scalar::inverted::encoding::compress_posting_list;
-    use crate::scalar::inverted::{CompressedPostingList, PostingTailCodec};
+    use crate::scalar::inverted::{CompressedPostingList, PlainPostingList, PostingTailCodec};
+    use arrow::buffer::ScalarBuffer;
 
     fn make_test_docs(n: usize) -> DocSet {
         let mut docs = DocSet::default();
         for i in 0..n {
             docs.append(i as u64, 10);
         }
+        docs
+    }
+
+    fn make_sparse_row_id_docs() -> DocSet {
+        let mut docs = DocSet::default();
+        docs.append(100, 10);
+        docs.append(200, 10);
+        docs.append(500, 10);
         docs
     }
 
@@ -621,13 +638,20 @@ mod tests {
         ))
     }
 
+    fn make_plain_posting(row_ids: Vec<u64>, freqs: Vec<f32>) -> PostingList {
+        PostingList::Plain(PlainPostingList::new(
+            ScalarBuffer::from(row_ids),
+            ScalarBuffer::from(freqs),
+            Some(1.0),
+            None,
+        ))
+    }
+
     #[test]
     fn test_saat_basic() {
         let docs = make_test_docs(1000);
         let posting = make_compressed_posting((0..100u32).collect(), vec![1u32; 100]);
-        let iter = PostingIterator::with_query_weight(
-            "test".to_string(), 0, 0, 1.0, posting, 1000,
-        );
+        let iter = PostingIterator::with_query_weight("test".to_string(), 0, 0, 1.0, posting, 1000);
 
         let params = FtsSearchParams::new().with_limit(Some(10));
         let mask = Arc::new(RowAddrMask::default());
@@ -646,14 +670,12 @@ mod tests {
         let docs = make_test_docs(1000);
 
         let posting1 = make_compressed_posting((0..100u32).collect(), vec![2u32; 100]);
-        let iter1 = PostingIterator::with_query_weight(
-            "alpha".to_string(), 0, 0, 1.0, posting1, 1000,
-        );
+        let iter1 =
+            PostingIterator::with_query_weight("alpha".to_string(), 0, 0, 1.0, posting1, 1000);
 
         let posting2 = make_compressed_posting((50..150u32).collect(), vec![3u32; 100]);
-        let iter2 = PostingIterator::with_query_weight(
-            "beta".to_string(), 1, 1, 1.0, posting2, 1000,
-        );
+        let iter2 =
+            PostingIterator::with_query_weight("beta".to_string(), 1, 1, 1.0, posting2, 1000);
 
         let params = FtsSearchParams::new().with_limit(Some(10));
         let mask = Arc::new(RowAddrMask::default());
@@ -669,7 +691,61 @@ mod tests {
             assert!(
                 doc_id >= 50 && doc_id < 100,
                 "expected doc in overlap range, got {} (row_id={}, score={:.4})",
-                doc_id, r.row_id, r.score,
+                doc_id,
+                r.row_id,
+                r.score,
+            );
+        }
+    }
+
+    #[test]
+    fn test_saat_plain_postings_match_compressed_scores() {
+        let docs = make_sparse_row_id_docs();
+
+        let compressed = PostingIterator::with_query_weight(
+            "test".to_string(),
+            0,
+            0,
+            1.0,
+            make_compressed_posting(vec![0, 2], vec![2, 1]),
+            docs.len(),
+        );
+        let plain = PostingIterator::with_query_weight(
+            "test".to_string(),
+            0,
+            0,
+            1.0,
+            make_plain_posting(vec![100, 500], vec![2.0, 1.0]),
+            docs.len(),
+        );
+
+        let params = FtsSearchParams::new().with_limit(Some(10));
+        let mask = Arc::new(RowAddrMask::default());
+        let metrics = crate::metrics::NoOpMetricsCollector;
+        let lut = ScoreLookupTable::new(&docs);
+
+        let compressed_results =
+            saat_bm25_search(&[compressed], &docs, &params, mask.clone(), &metrics, &lut);
+        let plain_results = saat_bm25_search(&[plain], &docs, &params, mask, &metrics, &lut);
+
+        let compressed_scores = compressed_results
+            .into_iter()
+            .map(|doc| (doc.row_id, doc.score))
+            .collect::<std::collections::HashMap<_, _>>();
+        let plain_scores = plain_results
+            .into_iter()
+            .map(|doc| (doc.row_id, doc.score))
+            .collect::<std::collections::HashMap<_, _>>();
+
+        assert_eq!(plain_scores.len(), compressed_scores.len());
+        for (row_id, expected_score) in compressed_scores {
+            let actual_score = plain_scores
+                .get(&row_id)
+                .copied()
+                .unwrap_or_else(|| panic!("missing row_id {row_id} in plain posting results"));
+            assert!(
+                (actual_score - expected_score).abs() < 1e-6,
+                "row_id={row_id}, actual_score={actual_score}, expected_score={expected_score}",
             );
         }
     }
@@ -683,7 +759,11 @@ mod tests {
         let bits: Vec<u32> = BitIter { word: 0, base: 0 }.collect();
         assert!(bits.is_empty());
 
-        let bits: Vec<u32> = BitIter { word: 1u64 << 63, base: 64 }.collect();
+        let bits: Vec<u32> = BitIter {
+            word: 1u64 << 63,
+            base: 64,
+        }
+        .collect();
         assert_eq!(bits, vec![64 + 63]);
     }
 

@@ -2,8 +2,8 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::fmt::{Debug, Display};
-use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::{
     cmp::{Reverse, min},
     collections::BinaryHeap,
@@ -597,6 +597,12 @@ impl InvertedIndex {
         prefilter: Arc<dyn PreFilter>,
         metrics: Arc<dyn MetricsCollector>,
     ) -> Result<(Vec<u64>, Vec<f32>)> {
+        if self.partitions.len() > 1 {
+            return self
+                .bm25_search(tokens, params, Operator::Or, prefilter, metrics)
+                .await;
+        }
+
         let limit = params.limit.unwrap_or(usize::MAX);
         if limit == 0 {
             return Ok((Vec::new(), Vec::new()));
@@ -618,7 +624,13 @@ impl InvertedIndex {
             let mask = mask.clone();
             let metrics = metrics.clone();
             let hits = spawn_cpu(move || {
-                part.bm25_search_saat_with_lut(params.as_ref(), mask, postings, metrics.as_ref(), &lut)
+                part.bm25_search_saat_with_lut(
+                    params.as_ref(),
+                    mask,
+                    postings,
+                    metrics.as_ref(),
+                    &lut,
+                )
             })
             .await?;
             for doc in hits {
@@ -1181,12 +1193,7 @@ impl InvertedPartition {
         }
         let lut = super::simd_scorer::ScoreLookupTable::new(&self.docs);
         Ok(super::simd_scorer::saat_bm25_search(
-            &postings,
-            &self.docs,
-            params,
-            mask,
-            metrics,
-            &lut,
+            &postings, &self.docs, params, mask, metrics, &lut,
         ))
     }
 
@@ -1203,12 +1210,7 @@ impl InvertedPartition {
             return Ok(Vec::new());
         }
         Ok(super::simd_scorer::saat_bm25_search(
-            &postings,
-            &self.docs,
-            params,
-            mask,
-            metrics,
-            lut,
+            &postings, &self.docs, params, mask, metrics, lut,
         ))
     }
 
@@ -3755,6 +3757,22 @@ impl DocSet {
             }
         }
     }
+
+    #[inline]
+    pub(crate) fn doc_index_by_row_id(&self, row_id: u64) -> Option<u32> {
+        if self.inv.is_empty() {
+            self.row_ids
+                .binary_search(&row_id)
+                .ok()
+                .map(|idx| idx as u32)
+        } else {
+            self.inv
+                .binary_search_by_key(&row_id, |x| x.0)
+                .ok()
+                .map(|idx| self.inv[idx].1)
+        }
+    }
+
     pub fn total_tokens_num(&self) -> u64 {
         self.total_tokens
     }
@@ -5315,6 +5333,86 @@ mod tests {
 
         let (row_ids, scores) = index
             .bm25_search(tokens, params, Operator::Or, prefilter, metrics)
+            .await
+            .unwrap();
+
+        assert_eq!(row_ids.len(), 2);
+        assert!(row_ids.contains(&100));
+        assert!(row_ids.contains(&200));
+        assert_eq!(row_ids.len(), scores.len());
+
+        let expected_idf = idf(2, 4);
+        for score in scores {
+            assert!(
+                (score - expected_idf).abs() < 1e-6,
+                "score: {}, expected: {}",
+                score,
+                expected_idf
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bm25_search_saat_uses_global_idf_across_partitions() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let mut builder0 = InnerBuilder::new(0, false, TokenSetFormat::default());
+        builder0.tokens.add("alpha".to_owned());
+        builder0.tokens.add("beta".to_owned());
+        builder0.posting_lists.push(PostingListBuilder::new(false));
+        builder0.posting_lists.push(PostingListBuilder::new(false));
+        builder0.posting_lists[0].add(0, PositionRecorder::Count(1));
+        builder0.posting_lists[1].add(1, PositionRecorder::Count(1));
+        builder0.posting_lists[1].add(2, PositionRecorder::Count(1));
+        builder0.docs.append(100, 1);
+        builder0.docs.append(101, 1);
+        builder0.docs.append(102, 1);
+        builder0.write(store.as_ref()).await.unwrap();
+
+        let mut builder1 = InnerBuilder::new(1, false, TokenSetFormat::default());
+        builder1.tokens.add("alpha".to_owned());
+        builder1.posting_lists.push(PostingListBuilder::new(false));
+        builder1.posting_lists[0].add(0, PositionRecorder::Count(1));
+        builder1.docs.append(200, 1);
+        builder1.write(store.as_ref()).await.unwrap();
+
+        let metadata = std::collections::HashMap::from_iter(vec![
+            (
+                "partitions".to_owned(),
+                serde_json::to_string(&vec![0u64, 1u64]).unwrap(),
+            ),
+            (
+                "params".to_owned(),
+                serde_json::to_string(&InvertedIndexParams::default()).unwrap(),
+            ),
+            (
+                TOKEN_SET_FORMAT_KEY.to_owned(),
+                TokenSetFormat::default().to_string(),
+            ),
+        ]);
+        let mut writer = store
+            .new_index_file(METADATA_FILE, Arc::new(arrow_schema::Schema::empty()))
+            .await
+            .unwrap();
+        writer.finish_with_metadata(metadata).await.unwrap();
+
+        let cache = Arc::new(LanceCache::with_capacity(4096));
+        let index = InvertedIndex::load(store.clone(), None, cache.as_ref())
+            .await
+            .unwrap();
+
+        let tokens = Arc::new(Tokens::new(vec!["alpha".to_string()], DocType::Text));
+        let params = Arc::new(FtsSearchParams::new().with_limit(Some(10)));
+        let prefilter = Arc::new(NoFilter);
+        let metrics = Arc::new(NoOpMetricsCollector);
+
+        let (row_ids, scores) = index
+            .bm25_search_saat(tokens, params, prefilter, metrics)
             .await
             .unwrap();
 
