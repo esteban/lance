@@ -469,7 +469,12 @@ fn process_compressed_list_with_lut(
             }
         }
 
-        // Score using LUT — replaces f32 division with table lookup
+        // Score using LUT — replaces f32 division with table lookup.
+        // NOTE: Software prefetch tested and REJECTED — Apple Silicon's hardware
+        // prefetcher already handles the doc_id → num_tokens/scores random access.
+        // 16 PRFM instructions per 8-doc chunk added more overhead than they saved
+        // (1.35ms vs 1.30ms baseline). The sorted, delta-encoded doc_ids within
+        // each block provide enough locality for the hardware prefetcher.
         let len = buffer.doc_ids.len().min(postings_budget - processed);
         let chunks = len / 8;
         for chunk in 0..chunks {
