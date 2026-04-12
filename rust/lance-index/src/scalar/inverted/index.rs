@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::fmt::{Debug, Display};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::{
     cmp::{Reverse, min},
@@ -612,12 +612,13 @@ impl InvertedIndex {
             if postings.is_empty() {
                 continue;
             }
+            let lut = Arc::new(super::simd_scorer::ScoreLookupTable::new(&part.docs));
             let part = part.clone();
             let params = params.clone();
             let mask = mask.clone();
             let metrics = metrics.clone();
             let hits = spawn_cpu(move || {
-                part.bm25_search_saat(params.as_ref(), mask, postings, metrics.as_ref())
+                part.bm25_search_saat_with_lut(params.as_ref(), mask, postings, metrics.as_ref(), &lut)
             })
             .await?;
             for doc in hits {
@@ -1178,12 +1179,36 @@ impl InvertedPartition {
         if postings.is_empty() {
             return Ok(Vec::new());
         }
+        let lut = super::simd_scorer::ScoreLookupTable::new(&self.docs);
         Ok(super::simd_scorer::saat_bm25_search(
             &postings,
             &self.docs,
             params,
             mask,
             metrics,
+            &lut,
+        ))
+    }
+
+    /// SAAT search with pre-built LUT (avoids per-query LUT construction).
+    pub fn bm25_search_saat_with_lut(
+        &self,
+        params: &FtsSearchParams,
+        mask: Arc<RowAddrMask>,
+        postings: Vec<PostingIterator>,
+        metrics: &dyn MetricsCollector,
+        lut: &super::simd_scorer::ScoreLookupTable,
+    ) -> Result<Vec<DocCandidate>> {
+        if postings.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(super::simd_scorer::saat_bm25_search(
+            &postings,
+            &self.docs,
+            params,
+            mask,
+            metrics,
+            lut,
         ))
     }
 
@@ -4308,7 +4333,7 @@ mod tests {
     use arrow_array::{ArrayRef, Float32Array, RecordBatch, StringArray, UInt32Array, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
     use std::collections::HashMap;
-    use std::sync::Arc;
+    use std::sync::{Arc, OnceLock};
 
     use super::*;
 

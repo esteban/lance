@@ -39,7 +39,7 @@ const MAX_FREQ_LUT: usize = 64;
 /// BM25 score LUT indexed by (freq, doc_length_bucket).
 /// Replaces BOTH f32 division AND doc_norm precomputation with a single table lookup.
 /// Eliminates the need for PrecomputedDocNorms entirely.
-struct ScoreLookupTable {
+pub(crate) struct ScoreLookupTable {
     table: Vec<f32>,
     dl_scale: f32,
     num_dl_buckets: usize,
@@ -49,7 +49,8 @@ struct ScoreLookupTable {
 const NUM_DL_BUCKETS: usize = 256;
 
 impl ScoreLookupTable {
-    fn new(docs: &DocSet) -> Self {
+
+    pub(crate) fn new(docs: &DocSet) -> Self {
         let num_tokens = docs.num_tokens_slice();
         let avgdl = docs.average_length();
         let b_over_avgdl = B / avgdl;
@@ -102,7 +103,7 @@ struct PrecomputedDocNorms {
 }
 
 impl PrecomputedDocNorms {
-    fn new(docs: &DocSet) -> Self {
+    pub(crate) fn new(docs: &DocSet) -> Self {
         let avgdl = docs.average_length();
         let b_over_avgdl = B / avgdl;
         let k1_times_one_minus_b = K1 * (1.0 - B);
@@ -338,6 +339,7 @@ pub fn saat_bm25_search(
     params: &FtsSearchParams,
     mask: Arc<RowAddrMask>,
     metrics: &dyn MetricsCollector,
+    lut: &ScoreLookupTable,
 ) -> Vec<DocCandidate> {
     let limit = params.limit.unwrap_or(usize::MAX);
     if limit == 0 || postings.is_empty() {
@@ -346,7 +348,6 @@ pub fn saat_bm25_search(
 
     let num_docs = docs.len();
     let num_tokens = docs.num_tokens_slice();
-    let lut = ScoreLookupTable::new(docs);
 
     // Sort terms by query_weight descending (rarest first)
     let mut term_order: Vec<(usize, f32)> = postings
@@ -632,7 +633,8 @@ mod tests {
         let mask = Arc::new(RowAddrMask::default());
         let metrics = crate::metrics::NoOpMetricsCollector;
 
-        let results = saat_bm25_search(&[iter], &docs, &params, mask, &metrics);
+        let lut = ScoreLookupTable::new(&docs);
+        let results = saat_bm25_search(&[iter], &docs, &params, mask, &metrics, &lut);
         assert_eq!(results.len(), 10);
         for r in &results {
             assert!(r.score > 0.0);
@@ -657,7 +659,8 @@ mod tests {
         let mask = Arc::new(RowAddrMask::default());
         let metrics = crate::metrics::NoOpMetricsCollector;
 
-        let results = saat_bm25_search(&[iter1, iter2], &docs, &params, mask, &metrics);
+        let lut = ScoreLookupTable::new(&docs);
+        let results = saat_bm25_search(&[iter1, iter2], &docs, &params, mask, &metrics, &lut);
         assert_eq!(results.len(), 10);
 
         // Docs 50-99 should score highest (both terms match)
