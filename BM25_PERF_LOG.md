@@ -109,3 +109,30 @@ To achieve 100x (5ms -> 50us), need fundamentally different approaches:
 |-----------|----------|---------|---------|
 | invert_search(1M) | 7.17 ms | 5.32 ms | **1.35x** |
 | invert_phrase_search(1M) | 12.84 ms | 12.22 ms | **1.05x** |
+
+## Changes Shipped (on perf/bm25-opt-01-smallvec + perf/bm25-opt-phase3-algo)
+
+### Phase 2 — Rust-Level Optimizations (1.35x)
+1. **Cache DocInfo in PostingIterator** — eliminates repeated decompression lookups on `doc()` calls. Dominant win at -25%.
+2. **Cache doc_id in HeadPosting** — avoids Box pointer chase in heap comparisons
+3. **SmallVec<16> for DocCandidate.freqs** — eliminates heap allocation for term frequencies
+4. **Single-partition fast path** — skip IDF re-scoring when partition-local IDF == global IDF
+5. **Precompute B/avg_doc_length** — replace division with multiplication in BM25 scoring
+6. **Add score field to DocCandidate** — carry WAND-computed scores through pipeline
+
+### Phase 3 — Profiling Infrastructure
+7. **WAND profiling counters** — inner_loop_iters, update_max_calls, threshold_prunes (gated by `WAND_PROFILE` env var)
+8. **Benchmark instrumentation** — comparison count + timing breakdown in benches/inverted.rs
+9. **BinaryHeap::from(vec) rebuild** — O(n) heapify instead of O(n log n) individual pushes
+
+## Architecture Notes
+
+The BM25 search pipeline in Lance uses **Block-Max WAND (BMW)** with:
+- BitPacker4x compressed posting lists (128-element blocks)
+- Block-max scores stored per block for early termination
+- Head/tail/lead three-partition posting iterator management
+- UnsafeCell-based decompression cache for block reuse
+
+The WAND implementation at `rust/lance-index/src/scalar/inverted/wand.rs` (~1700 lines) is already
+well-optimized for its algorithmic class. The **73ns per-iteration cost** is near CPU-optimal
+for the heap + score + advance operations at query term counts of 10-15.
