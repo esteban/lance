@@ -276,9 +276,9 @@ pub fn saat_bm25_search(
     let mut buffer = DecodeBuffer::new();
     let mut num_comparisons = 0usize;
 
-    // Heuristic: postings budget adaptive to query complexity.
-    // For top-10 with 10 terms, 200K postings ≈ 20K per term on average.
-    // Validated at 79.0% recall across 200 corpus-wide queries on a 100K-doc Zipf corpus
+    // Heuristic: scale with limit/term count, but keep at least a 100K postings floor.
+    // For the current top-10 query mix (3-15 terms), that floor dominates.
+    // Validated at 89.2% recall across 200 corpus-wide queries on a 100K-doc Zipf corpus
     // (see test_saat_vs_wand_correctness). Both budget and the 0.15 suffix-sum threshold
     // are sensitive knobs — re-validate if either the corpus distribution or limit changes.
     let postings_budget = (10 * limit * term_order.len()).max(100_000);
@@ -811,13 +811,13 @@ mod integration_tests {
             TOTAL / 1000
         );
 
-        // Threshold validated at 79.0% measured recall across 200 corpus-wide queries
+        // Threshold validated at 89.2% measured recall across 200 corpus-wide queries
         // (random-doc sampling, seed=99) on a 100K-doc Zipf corpus (exponent=1.1).
-        // 75% provides headroom for seed/corpus variance while catching regressions in
+        // 85% provides headroom for seed/corpus variance while catching regressions in
         // the postings budget or suffix-sum early-exit heuristics.
         assert!(
             avg_recall >= 0.85,
-            "SAAT recall too low: {:.1}% (expected >= 75%)",
+            "SAAT recall too low: {:.1}% (expected >= 85%)",
             avg_recall * 100.0
         );
     }
