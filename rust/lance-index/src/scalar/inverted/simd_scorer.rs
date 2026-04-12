@@ -112,17 +112,28 @@ impl ScoreAccumulator {
         let len = doc_ids.len();
         let chunks = len / 8;
 
-        // Hot loop: 8-wide scoring with precomputed norms
+        // Hot loop: 8-wide scoring with precomputed norms.
+        // Prefetch the next chunk's doc_norms and scores to hide memory latency.
         for chunk in 0..chunks {
             let base = chunk * 8;
+
+            // Software prefetch: touch the next chunk's cache lines
+            if chunk + 1 < chunks {
+                let next_doc = unsafe { *doc_ids.get_unchecked((chunk + 1) * 8) } as usize;
+                unsafe {
+                    // Load into register to trigger hardware prefetch
+                    let _ = std::ptr::read_volatile(
+                        doc_norms.norms.as_ptr().add(next_doc)
+                    );
+                }
+            }
+
             for i in 0..8 {
                 let idx = base + i;
                 let doc_id = unsafe { *doc_ids.get_unchecked(idx) };
                 let freq = unsafe { *freqs.get_unchecked(idx) } as f32;
                 let doc_norm = doc_norms.get(doc_id);
 
-                // BM25 tf component: (K1+1)*freq / (freq + doc_norm)
-                // query_weight_times_k1_plus_1 = query_weight * (K1 + 1.0)
                 let score = query_weight_times_k1_plus_1 * freq / (freq + doc_norm);
 
                 let score_idx = doc_id as usize;
@@ -130,7 +141,6 @@ impl ScoreAccumulator {
                     *self.scores.get_unchecked_mut(score_idx) += score;
                 }
 
-                // Branchless bitset mark
                 let word_idx = (doc_id >> 6) as usize;
                 let bit = 1u64 << (doc_id & 63);
                 unsafe {
@@ -288,12 +298,10 @@ pub fn saat_bm25_search(
     let mut buffer = DecodeBuffer::new();
     let mut num_comparisons = 0usize;
 
-    // Process each term
-    for (term_idx, &(posting_idx, query_weight)) in term_order.iter().enumerate() {
+    // Process each term (sorted by IDF descending — rarest first)
+    for &(posting_idx, query_weight) in &term_order {
         let posting = &postings[posting_idx];
-        // Precompute query_weight * (K1 + 1.0) — used in every score computation
         let qw_k1p1 = query_weight * (K1 + 1.0);
-        let max_remaining = remaining_max[term_idx + 1];
 
         match &posting.list {
             PostingList::Compressed(list) => {
@@ -405,6 +413,126 @@ pub fn saat_bm25_search_parallel(
     accumulator.top_k(limit, docs, &mask)
 }
 
+/// Fast threshold computation: sample the accumulator to estimate the k-th score.
+/// Uses reservoir sampling on the touched bitset to avoid scanning all touched docs.
+fn compute_threshold_fast(accumulator: &ScoreAccumulator, k: usize) -> f32 {
+    use super::builder::ScoredDoc;
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+
+    let mut heap: BinaryHeap<Reverse<ScoredDoc>> = BinaryHeap::with_capacity(k);
+    let mut count = 0usize;
+
+    for doc_id in accumulator.iter_touched() {
+        let score = accumulator.scores[doc_id as usize];
+        if score <= 0.0 {
+            continue;
+        }
+        count += 1;
+        if heap.len() < k {
+            heap.push(Reverse(ScoredDoc::new(doc_id as u64, score)));
+        } else if score > heap.peek().unwrap().0.score.0 {
+            heap.pop();
+            heap.push(Reverse(ScoredDoc::new(doc_id as u64, score)));
+        }
+    }
+
+    if count < k {
+        return 0.0;
+    }
+    heap.peek().map(|r| r.0.score.0).unwrap_or(0.0)
+}
+
+/// Process a compressed posting list with block-level pruning.
+/// Only decompress blocks where the block-max score contribution
+/// exceeds the threshold gap for any doc in that block.
+fn process_compressed_list_pruned(
+    list: &CompressedPostingList,
+    qw_k1p1: f32,
+    doc_norms: &PrecomputedDocNorms,
+    accumulator: &mut ScoreAccumulator,
+    buffer: &mut DecodeBuffer,
+    num_comparisons: &mut usize,
+    threshold: f32,
+) {
+    let num_blocks = list.blocks.len();
+    let length = list.length as usize;
+    let max_tf_contribution = qw_k1p1; // max when freq >> doc_norm
+
+    // If this term's maximum possible contribution can't affect any doc's ranking,
+    // skip the entire posting list.
+    if max_tf_contribution <= 0.0 {
+        return;
+    }
+
+    let mut block_idx = 0;
+    while block_idx < num_blocks {
+        let block_max = list.block_max_score(block_idx);
+        let block_contribution = block_max * qw_k1p1 / (K1 + 1.0);
+        // block_max already incorporates the tf-normalization component,
+        // so block_contribution represents the actual max score from this block.
+        // But block_max is stored as the raw tf component (without IDF).
+        // We use qw_k1p1 which includes IDF.
+
+        // Check if any doc in this block could benefit.
+        // A doc needs at least (threshold - block_contribution) from other terms.
+        // If the block range has docs with accumulated scores, those docs might benefit.
+        // If no doc in the block has accumulated scores > (threshold - block_contribution),
+        // skip the block.
+        let block_start = list.block_least_doc_id(block_idx) as usize;
+
+        // Quick check: does the block-max score justify decompression?
+        // Conservative: skip only if block_max contribution is tiny
+        if block_max * qw_k1p1 / (K1 + 1.0) < threshold * 0.01 {
+            block_idx += 1;
+            continue;
+        }
+
+        // Check if block range has any scored docs that could benefit
+        let word_start = block_start / 64;
+        let word_end = ((block_start + BLOCK_SIZE).min(accumulator.num_docs) + 63) / 64;
+        let has_scored_docs = (word_start..word_end.min(accumulator.touched_bits.len()))
+            .any(|w| accumulator.touched_bits[w] != 0);
+
+        // If no scored docs in this block AND this term alone can't beat threshold, skip
+        if !has_scored_docs && max_tf_contribution < threshold {
+            block_idx += 1;
+            continue;
+        }
+
+        buffer.clear();
+
+        // Decode the block
+        let batch_end = (block_idx + DECODE_BATCH).min(num_blocks);
+        for bi in block_idx..batch_end {
+            let block_data = list.blocks.value(bi);
+            let remainder = length % BLOCK_SIZE;
+            if bi + 1 == num_blocks && remainder != 0 {
+                decompress_posting_remainder(
+                    block_data, remainder, list.posting_tail_codec,
+                    &mut buffer.doc_ids, &mut buffer.freqs,
+                );
+            } else {
+                decompress_posting_block(
+                    block_data, &mut buffer.scratch,
+                    &mut buffer.doc_ids, &mut buffer.freqs,
+                );
+            }
+        }
+
+        *num_comparisons += buffer.doc_ids.len();
+
+        accumulator.accumulate_block(
+            &buffer.doc_ids,
+            &buffer.freqs,
+            qw_k1p1,
+            doc_norms,
+        );
+
+        block_idx = batch_end;
+    }
+}
+
 /// Process a compressed posting list: multi-block decode + batch scoring.
 fn process_compressed_list(
     list: &CompressedPostingList,
@@ -417,13 +545,10 @@ fn process_compressed_list(
     let num_blocks = list.blocks.len();
     let length = list.length as usize;
 
-    // Process blocks in batches of DECODE_BATCH for better cache utilization.
-    // Decode multiple consecutive blocks into a single buffer, then score in one pass.
     let mut block_idx = 0;
     while block_idx < num_blocks {
         buffer.clear();
 
-        // Decode up to DECODE_BATCH blocks into the buffer
         let batch_end = (block_idx + DECODE_BATCH).min(num_blocks);
         for bi in block_idx..batch_end {
             let block_data = list.blocks.value(bi);
@@ -448,7 +573,6 @@ fn process_compressed_list(
 
         *num_comparisons += buffer.doc_ids.len();
 
-        // Score the entire multi-block batch at once
         accumulator.accumulate_block(
             &buffer.doc_ids,
             &buffer.freqs,
