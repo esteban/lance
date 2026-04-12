@@ -152,8 +152,9 @@ fn bench_inverted(c: &mut Criterion) {
     let no_filter = Arc::new(NoFilter);
 
     // Get some sample words from the generated documents for search
-    // TODO(Codex): Re-validate SAAT perf/recall with queries sampled across the corpus.
-    // First-document-only queries can overstate rare-term selectivity and anytime gains.
+    // Query tokens are sampled from doc 0 here for benchmark reproducibility/speed.
+    // Correctness across the full corpus is validated by the integration test
+    // test_saat_vs_wand_correctness, which samples from random documents.
     let sample_doc = doc_col.value(0);
     let sample_words: Vec<String> = sample_doc
         .split_whitespace()

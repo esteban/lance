@@ -598,8 +598,8 @@ impl InvertedIndex {
         metrics: Arc<dyn MetricsCollector>,
     ) -> Result<(Vec<u64>, Vec<f32>)> {
         if self.partitions.len() > 1 {
-            // TODO(Codex): Re-validate SAAT perf claims separately for multi-partition queries.
-            // After the correctness fix, the SAAT fast path only applies to single partitions.
+            // Multi-partition queries fall back to WAND; SAAT's anytime budget applies
+            // per-partition and would require cross-partition score merging to be correct.
             return self
                 .bm25_search(tokens, params, Operator::Or, prefilter, metrics)
                 .await;
