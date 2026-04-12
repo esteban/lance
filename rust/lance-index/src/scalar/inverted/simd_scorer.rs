@@ -36,63 +36,56 @@ const DECODE_BATCH_DOCS: usize = DECODE_BATCH * BLOCK_SIZE;
 const MAX_FREQ_LUT: usize = 64;
 
 /// Precomputed BM25 tf-score lookup table.
-/// For each (freq, doc_norm_bucket) pair, stores: (K1+1) * freq / (freq + norm)
-/// This replaces the f32 division in the scoring hot loop with a table lookup.
+/// BM25 score LUT indexed by (freq, doc_length_bucket).
+/// Replaces BOTH f32 division AND doc_norm precomputation with a single table lookup.
+/// Eliminates the need for PrecomputedDocNorms entirely.
 struct ScoreLookupTable {
-    /// Table layout: [freq][norm_bucket] → tf_score
-    /// norm_bucket = (doc_norm * NORM_SCALE) as usize, clamped to [0, NUM_NORM_BUCKETS)
     table: Vec<f32>,
-    norm_scale: f32,
-    num_norm_buckets: usize,
+    dl_scale: f32,
+    num_dl_buckets: usize,
+    avgdl: f32,
 }
 
-const NUM_NORM_BUCKETS: usize = 256;
+const NUM_DL_BUCKETS: usize = 256;
 
 impl ScoreLookupTable {
-    fn new(doc_norms: &PrecomputedDocNorms) -> Self {
-        // Find the range of doc_norms to set bucket boundaries
-        let max_norm = doc_norms.norms.iter().copied().fold(0.0f32, f32::max);
-        let min_norm = doc_norms
-            .norms
-            .iter()
-            .copied()
-            .fold(f32::MAX, f32::min);
-        let norm_range = (max_norm - min_norm).max(0.001);
-        let norm_scale = (NUM_NORM_BUCKETS - 1) as f32 / norm_range;
+    fn new(docs: &DocSet) -> Self {
+        let num_tokens = docs.num_tokens_slice();
+        let avgdl = docs.average_length();
+        let b_over_avgdl = B / avgdl;
+        let k1_one_minus_b = K1 * (1.0 - B);
 
-        let mut table = vec![0.0f32; MAX_FREQ_LUT * NUM_NORM_BUCKETS];
+        let max_dl = num_tokens.iter().copied().max().unwrap_or(1) as f32;
+        let dl_scale = (NUM_DL_BUCKETS - 1) as f32 / max_dl.max(1.0);
+
+        let mut table = vec![0.0f32; MAX_FREQ_LUT * NUM_DL_BUCKETS];
         let k1_plus_1 = K1 + 1.0;
         for freq in 0..MAX_FREQ_LUT {
             let f = freq as f32;
-            for bucket in 0..NUM_NORM_BUCKETS {
-                let norm = min_norm + (bucket as f32) / norm_scale;
-                table[freq * NUM_NORM_BUCKETS + bucket] = k1_plus_1 * f / (f + norm);
+            for bucket in 0..NUM_DL_BUCKETS {
+                let dl = bucket as f32 / dl_scale;
+                let doc_norm = k1_one_minus_b + K1 * b_over_avgdl * dl;
+                table[freq * NUM_DL_BUCKETS + bucket] = k1_plus_1 * f / (f + doc_norm);
             }
         }
 
-        Self {
-            table,
-            norm_scale,
-            num_norm_buckets: NUM_NORM_BUCKETS,
-        }
+        Self { table, dl_scale, num_dl_buckets: NUM_DL_BUCKETS, avgdl }
     }
 
-    /// Look up the tf-score for a given frequency and doc_norm.
-    /// Returns query_weight * tf_score.
     #[inline(always)]
-    fn score(&self, freq: u32, doc_norm: f32, query_weight: f32) -> f32 {
+    fn score(&self, freq: u32, doc_tokens: u32, query_weight: f32) -> f32 {
         if (freq as usize) < MAX_FREQ_LUT {
             let bucket =
-                ((doc_norm * self.norm_scale) as usize).min(self.num_norm_buckets - 1);
+                ((doc_tokens as f32 * self.dl_scale) as usize).min(self.num_dl_buckets - 1);
             let tf = unsafe {
                 *self
                     .table
-                    .get_unchecked(freq as usize * self.num_norm_buckets + bucket)
+                    .get_unchecked(freq as usize * self.num_dl_buckets + bucket)
             };
             query_weight * tf
         } else {
-            // Fallback for high frequencies
             let f = freq as f32;
+            let doc_norm = K1 * (1.0 - B + B * doc_tokens as f32 / self.avgdl);
             query_weight * (K1 + 1.0) * f / (f + doc_norm)
         }
     }
@@ -188,7 +181,8 @@ impl ScoreAccumulator {
         doc_ids: &[u32],
         freqs: &[u32],
         query_weight_times_k1_plus_1: f32,
-        doc_norms: &PrecomputedDocNorms,
+        num_tokens: &[u32],
+        b_over_avgdl: f32,
     ) {
         let len = doc_ids.len();
         let chunks = len / 8;
@@ -200,8 +194,9 @@ impl ScoreAccumulator {
                 let idx = base + i;
                 let doc_id = unsafe { *doc_ids.get_unchecked(idx) };
                 let freq = unsafe { *freqs.get_unchecked(idx) } as f32;
-                let doc_norm = doc_norms.get(doc_id);
+                let doc_tokens = num_tokens[doc_id as usize];
 
+                let doc_norm = K1 * (1.0 - B + b_over_avgdl * doc_tokens as f32);
                 let score = query_weight_times_k1_plus_1 * freq / (freq + doc_norm);
                 let quantized = (score * scale) as u16;
 
@@ -222,8 +217,9 @@ impl ScoreAccumulator {
         for idx in (chunks * 8)..len {
             let doc_id = doc_ids[idx];
             let freq = freqs[idx] as f32;
-            let doc_norm = doc_norms.get(doc_id);
-            let score = query_weight_times_k1_plus_1 * freq / (freq + doc_norm);
+            let doc_tokens = num_tokens[doc_id as usize];
+            let doc_norm = K1 * (1.0 - B + b_over_avgdl * doc_tokens as f32);
+                let score = query_weight_times_k1_plus_1 * freq / (freq + doc_norm);
             let quantized = (score * scale) as u16;
 
             let score_idx = doc_id as usize;
@@ -349,8 +345,8 @@ pub fn saat_bm25_search(
     }
 
     let num_docs = docs.len();
-    let doc_norms = PrecomputedDocNorms::new(docs);
-    let lut = ScoreLookupTable::new(&doc_norms);
+    let num_tokens = docs.num_tokens_slice();
+    let lut = ScoreLookupTable::new(docs);
 
     // Sort terms by query_weight descending (rarest first)
     let mut term_order: Vec<(usize, f32)> = postings
@@ -374,13 +370,13 @@ pub fn saat_bm25_search(
 
     // Anytime postings budget: adaptive to query complexity.
     // For top-10 with 10 terms, 200K postings ≈ 20K per term on average.
-    let postings_budget = (20 * limit * term_order.len()).max(100_000);
+    let postings_budget = (10 * limit * term_order.len()).max(50_000);
     let mut postings_remaining = postings_budget;
     let mut threshold = 0.0f32;
 
     for (term_idx, &(posting_idx, query_weight)) in term_order.iter().enumerate() {
         // Term-level early exit
-        if threshold > 0.0 && remaining_max[term_idx] < threshold * 0.05 {
+        if term_idx >= 3 && threshold > 0.0 && remaining_max[term_idx] < threshold * 0.15 {
             break;
         }
         if postings_remaining == 0 {
@@ -394,7 +390,7 @@ pub fn saat_bm25_search(
                 let processed = process_compressed_list_with_lut(
                     list,
                     query_weight,
-                    &doc_norms,
+                    num_tokens,
                     &lut,
                     &mut accumulator,
                     &mut buffer,
@@ -409,8 +405,8 @@ pub fn saat_bm25_search(
                 for i in 0..to_process {
                     let row_id = list.row_ids[i] as u32;
                     let freq = list.frequencies[i] as u32;
-                    let doc_norm = doc_norms.get(row_id);
-                    let score = lut.score(freq, doc_norm, query_weight * (K1 + 1.0));
+                    let doc_tokens = num_tokens[row_id as usize];
+                    let score = lut.score(freq, doc_tokens, query_weight * (K1 + 1.0));
                     let quantized = (score * scale) as u16;
                     let idx = row_id as usize;
                     accumulator.scores[idx] = accumulator.scores[idx].saturating_add(quantized);
@@ -431,91 +427,6 @@ pub fn saat_bm25_search(
     accumulator.top_k(limit, docs, &mask)
 }
 
-/// Parallel SAAT: process terms concurrently using rayon, merge accumulators.
-/// Each thread gets a ScoreAccumulator for a subset of terms.
-pub fn saat_bm25_search_parallel(
-    postings: &[PostingIterator],
-    docs: &DocSet,
-    params: &FtsSearchParams,
-    mask: Arc<RowAddrMask>,
-    metrics: &dyn MetricsCollector,
-) -> Vec<DocCandidate> {
-    let limit = params.limit.unwrap_or(usize::MAX);
-    if limit == 0 || postings.is_empty() {
-        return Vec::new();
-    }
-
-    let num_docs = docs.len();
-    let doc_norms = Arc::new(PrecomputedDocNorms::new(docs));
-
-    // Collect (posting_list_ref, qw_k1p1) — avoid passing PostingIterator to rayon
-    // since UnsafeCell<CompressedState> is !Sync. We only need the list.
-    let terms: Vec<(&PostingList, f32)> = postings
-        .iter()
-        .map(|p| (&p.list, p.query_weight * (K1 + 1.0)))
-        .filter(|(_, qw)| *qw > 0.0)
-        .collect();
-
-    if terms.is_empty() {
-        return Vec::new();
-    }
-
-    // Process terms in parallel using thread-local score accumulators.
-    // Each thread accumulates into its own dense f32 array to avoid
-    // Vec<(u32,f32)> allocation overhead.
-    let partial_accumulators: Vec<ScoreAccumulator> = terms
-        .par_iter()
-        .map(|&(ref list, qw_k1p1)| {
-            let doc_norms = &doc_norms;
-            let mut acc = ScoreAccumulator::new(num_docs, qw_k1p1);
-            let mut buffer = DecodeBuffer::new();
-
-            match list {
-                PostingList::Compressed(clist) => {
-                    process_compressed_list(clist, qw_k1p1, doc_norms, &mut acc, &mut buffer, &mut 0);
-                }
-                PostingList::Plain(plist) => {
-                    for i in 0..plist.row_ids.len() {
-                        let doc_id = plist.row_ids[i] as u32;
-                        let freq = plist.frequencies[i] as f32;
-                        let doc_norm = doc_norms.get(doc_id);
-                        let score = qw_k1p1 * freq / (freq + doc_norm);
-                        let quantized = (score * acc.scale) as u16;
-                        acc.scores[doc_id as usize] = acc.scores[doc_id as usize].saturating_add(quantized);
-                        acc.touched_bits[(doc_id >> 6) as usize] |= 1u64 << (doc_id & 63);
-                    }
-                }
-            }
-            acc
-        })
-        .collect();
-
-    // Merge accumulators: add score arrays and OR touched bitsets
-    let max_possible_score: f32 = terms.iter().map(|(_, qw)| *qw).sum();
-    let mut accumulator = ScoreAccumulator::new(num_docs, max_possible_score);
-    let mut total_comparisons = 0usize;
-    for partial in &partial_accumulators {
-        for i in 0..num_docs {
-            unsafe {
-                let current = *accumulator.scores.get_unchecked(i);
-                let additional = *partial.scores.get_unchecked(i);
-                *accumulator.scores.get_unchecked_mut(i) = current.saturating_add(additional);
-            }
-        }
-        // Merge touched bitsets
-        for (dst, src) in accumulator.touched_bits.iter_mut().zip(&partial.touched_bits) {
-            *dst |= *src;
-        }
-    }
-    // Count total comparisons from bitset population count
-    total_comparisons = accumulator.touched_bits.iter().map(|w| w.count_ones() as usize).sum();
-
-    metrics.record_comparisons(total_comparisons);
-    accumulator.top_k(limit, docs, &mask)
-}
-
-/// Fast threshold computation: sample the accumulator to estimate the k-th score.
-/// Uses reservoir sampling on the touched bitset to avoid scanning all touched docs.
 fn compute_threshold_fast(accumulator: &ScoreAccumulator, k: usize) -> f32 {
     use super::builder::ScoredDoc;
     use std::cmp::Reverse;
@@ -548,99 +459,11 @@ fn compute_threshold_fast(accumulator: &ScoreAccumulator, k: usize) -> f32 {
 /// Process a compressed posting list with block-level pruning.
 /// Only decompress blocks where the block-max score contribution
 /// exceeds the threshold gap for any doc in that block.
-fn process_compressed_list_pruned(
-    list: &CompressedPostingList,
-    qw_k1p1: f32,
-    doc_norms: &PrecomputedDocNorms,
-    accumulator: &mut ScoreAccumulator,
-    buffer: &mut DecodeBuffer,
-    num_comparisons: &mut usize,
-    threshold: f32,
-) {
-    let num_blocks = list.blocks.len();
-    let length = list.length as usize;
-    let max_tf_contribution = qw_k1p1; // max when freq >> doc_norm
-
-    // If this term's maximum possible contribution can't affect any doc's ranking,
-    // skip the entire posting list.
-    if max_tf_contribution <= 0.0 {
-        return;
-    }
-
-    let mut block_idx = 0;
-    while block_idx < num_blocks {
-        let block_max = list.block_max_score(block_idx);
-        let block_contribution = block_max * qw_k1p1 / (K1 + 1.0);
-        // block_max already incorporates the tf-normalization component,
-        // so block_contribution represents the actual max score from this block.
-        // But block_max is stored as the raw tf component (without IDF).
-        // We use qw_k1p1 which includes IDF.
-
-        // Check if any doc in this block could benefit.
-        // A doc needs at least (threshold - block_contribution) from other terms.
-        // If the block range has docs with accumulated scores, those docs might benefit.
-        // If no doc in the block has accumulated scores > (threshold - block_contribution),
-        // skip the block.
-        let block_start = list.block_least_doc_id(block_idx) as usize;
-
-        // Quick check: does the block-max score justify decompression?
-        // Conservative: skip only if block_max contribution is tiny
-        if block_max * qw_k1p1 / (K1 + 1.0) < threshold * 0.01 {
-            block_idx += 1;
-            continue;
-        }
-
-        // Check if block range has any scored docs that could benefit
-        let word_start = block_start / 64;
-        let word_end = ((block_start + BLOCK_SIZE).min(accumulator.num_docs) + 63) / 64;
-        let has_scored_docs = (word_start..word_end.min(accumulator.touched_bits.len()))
-            .any(|w| accumulator.touched_bits[w] != 0);
-
-        // If no scored docs in this block AND this term alone can't beat threshold, skip
-        if !has_scored_docs && max_tf_contribution < threshold {
-            block_idx += 1;
-            continue;
-        }
-
-        buffer.clear();
-
-        // Decode the block
-        let batch_end = (block_idx + DECODE_BATCH).min(num_blocks);
-        for bi in block_idx..batch_end {
-            let block_data = list.blocks.value(bi);
-            let remainder = length % BLOCK_SIZE;
-            if bi + 1 == num_blocks && remainder != 0 {
-                decompress_posting_remainder(
-                    block_data, remainder, list.posting_tail_codec,
-                    &mut buffer.doc_ids, &mut buffer.freqs,
-                );
-            } else {
-                decompress_posting_block(
-                    block_data, &mut buffer.scratch,
-                    &mut buffer.doc_ids, &mut buffer.freqs,
-                );
-            }
-        }
-
-        *num_comparisons += buffer.doc_ids.len();
-
-        accumulator.accumulate_block(
-            &buffer.doc_ids,
-            &buffer.freqs,
-            qw_k1p1,
-            doc_norms,
-        );
-
-        block_idx = batch_end;
-    }
-}
-
-/// Process a compressed posting list with LUT scoring and postings budget.
 /// Returns the number of postings processed.
 fn process_compressed_list_with_lut(
     list: &CompressedPostingList,
     query_weight: f32,
-    doc_norms: &PrecomputedDocNorms,
+    num_tokens: &[u32],
     lut: &ScoreLookupTable,
     accumulator: &mut ScoreAccumulator,
     buffer: &mut DecodeBuffer,
@@ -681,8 +504,8 @@ fn process_compressed_list_with_lut(
                 let idx = base + i;
                 let doc_id = unsafe { *buffer.doc_ids.get_unchecked(idx) };
                 let freq = unsafe { *buffer.freqs.get_unchecked(idx) };
-                let doc_norm = doc_norms.get(doc_id);
-                let score = lut.score(freq, doc_norm, query_weight);
+                let doc_tokens = num_tokens[doc_id as usize];
+                let score = lut.score(freq, doc_tokens, query_weight);
                 let quantized = (score * scale) as u16;
 
                 let score_idx = doc_id as usize;
@@ -697,8 +520,8 @@ fn process_compressed_list_with_lut(
         for idx in (chunks * 8)..len {
             let doc_id = buffer.doc_ids[idx];
             let freq = buffer.freqs[idx];
-            let doc_norm = doc_norms.get(doc_id);
-            let score = lut.score(freq, doc_norm, query_weight);
+            let doc_tokens = num_tokens[doc_id as usize];
+            let score = lut.score(freq, doc_tokens, query_weight);
             let quantized = (score * scale) as u16;
             accumulator.scores[doc_id as usize] =
                 accumulator.scores[doc_id as usize].saturating_add(quantized);
@@ -716,7 +539,7 @@ fn process_compressed_list_with_lut(
 fn process_compressed_list(
     list: &CompressedPostingList,
     qw_k1p1: f32,
-    doc_norms: &PrecomputedDocNorms,
+    num_tokens: &[u32],
     accumulator: &mut ScoreAccumulator,
     buffer: &mut DecodeBuffer,
     num_comparisons: &mut usize,
@@ -756,7 +579,8 @@ fn process_compressed_list(
             &buffer.doc_ids,
             &buffer.freqs,
             qw_k1p1,
-            doc_norms,
+            num_tokens,
+            0.0,
         );
 
         block_idx = batch_end;
