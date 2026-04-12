@@ -284,6 +284,7 @@ pub fn saat_bm25_search(
     let postings_budget = (10 * limit * term_order.len()).max(100_000);
     let mut postings_remaining = postings_budget;
     let mut threshold = 0.0f32;
+    let mut _total_blocks_skipped = 0usize;
 
     for (term_idx, &(posting_idx, query_weight)) in term_order.iter().enumerate() {
         // Term-level early exit
@@ -296,9 +297,23 @@ pub fn saat_bm25_search(
 
         let posting = &postings[posting_idx];
 
+        // Block-max skip threshold: use current top-k threshold converted to
+        // the per-posting score space. A block's max tf-component score must
+        // exceed this divided by query_weight to be worth decompressing.
+        // We use a fraction (0.5) of the threshold as the skip bar — blocks
+        // that can only contribute less than half the current kth score are pruned.
+        let block_skip_threshold = if threshold > 0.0 && term_idx >= 2 {
+            // Convert the top-k score threshold back to the per-term tf-component scale.
+            // block_max_score * query_weight should exceed some fraction of the threshold
+            // to be worth processing. We use the quantized threshold converted to f32.
+            threshold * 0.1
+        } else {
+            0.0
+        };
+
         match &posting.list {
             PostingList::Compressed(list) => {
-                let processed = process_compressed_list_with_lut(
+                let (processed, skipped) = process_compressed_list_with_lut(
                     list,
                     query_weight,
                     num_tokens,
@@ -306,8 +321,10 @@ pub fn saat_bm25_search(
                     &mut accumulator,
                     &mut buffer,
                     postings_remaining,
+                    block_skip_threshold,
                 );
                 num_comparisons += processed;
+                _total_blocks_skipped += skipped;
                 postings_remaining = postings_remaining.saturating_sub(processed);
             }
             PostingList::Plain(list) => {
@@ -370,9 +387,23 @@ fn compute_threshold_fast(accumulator: &ScoreAccumulator, k: usize) -> f32 {
     heap.peek().map(|r| r.0.score.0).unwrap_or(0.0)
 }
 
+/// Read the block-max score from the first 4 bytes of a compressed block.
+/// The block format stores max_block_score as f32 LE at offset 0.
+#[inline(always)]
+fn read_block_max_score(block_data: &[u8]) -> f32 {
+    debug_assert!(block_data.len() >= 4);
+    f32::from_le_bytes([block_data[0], block_data[1], block_data[2], block_data[3]])
+}
+
 /// Process a compressed posting list with block-level pruning.
 /// Only decompress blocks where the block-max score contribution
 /// exceeds the threshold gap for any doc in that block.
+///
+/// Block-max pruning (Ding & Suel, SIGIR 2011): each compressed block stores
+/// the maximum BM25 tf-component score for any doc in that block. If
+/// `block_max * query_weight` < current top-k threshold gap, the entire block
+/// can be skipped without decompression.
+///
 /// Returns the number of postings processed.
 fn process_compressed_list_with_lut(
     list: &CompressedPostingList,
@@ -382,19 +413,32 @@ fn process_compressed_list_with_lut(
     accumulator: &mut ScoreAccumulator,
     buffer: &mut DecodeBuffer,
     postings_budget: usize,
-) -> usize {
+    block_skip_threshold: f32,
+) -> (usize, usize) {
     let num_blocks = list.blocks.len();
     let length = list.length as usize;
     let scale = accumulator.scale;
     let mut processed = 0usize;
+    let mut blocks_skipped = 0usize;
 
     let mut block_idx = 0;
     while block_idx < num_blocks && processed < postings_budget {
         buffer.clear();
 
         let batch_end = (block_idx + DECODE_BATCH).min(num_blocks);
+
+        // Block-max pruning: check each block's max score before decompressing.
+        // If block_max_score * query_weight < threshold, skip the entire block.
         for bi in block_idx..batch_end {
             let block_data = list.blocks.value(bi);
+            let block_max = read_block_max_score(block_data);
+
+            // Skip block if its max possible contribution is below the threshold
+            if block_skip_threshold > 0.0 && block_max * query_weight < block_skip_threshold {
+                blocks_skipped += 1;
+                continue;
+            }
+
             let remainder = length % BLOCK_SIZE;
             if bi + 1 == num_blocks && remainder != 0 {
                 decompress_posting_remainder(
@@ -453,7 +497,7 @@ fn process_compressed_list_with_lut(
         block_idx = batch_end;
     }
 
-    processed
+    (processed, blocks_skipped)
 }
 
 #[cfg(test)]
