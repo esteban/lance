@@ -140,6 +140,7 @@ Implemented Score-at-a-Time (SAAT) alternative search path with:
 | SAAT v2 (optimized) | 7.44 ms | 15 ns | ~500K | Precomputed norms, bitset, unsafe |
 | SAAT parallel (rayon) | 7.12 ms | -- | ~500K | Merge phase (40MB) limits gains |
 | SAAT + block pruning | 7.79 ms | -- | ~500K | Pruning overhead > benefit |
+| SAAT + u16 quantized | 7.30 ms | 15 ns | ~500K | u16 cache density gain (Mackenzie et al.) |
 
 ### SAAT Optimization History
 
@@ -153,6 +154,17 @@ Implemented Score-at-a-Time (SAAT) alternative search path with:
 | Block-level pruning | +4% (worse) | Overhead exceeds pruning benefit |
 | Parallel rayon term processing | +5% (worse) | 10x4MB merge dominates |
 | Two-phase threshold + pruned path | +5% (worse) | threshold_fast scan too expensive |
+| u16 quantized accumulators | -2% | Cache density benefit limited at 1M docs |
+| Parallel rayon (thread-local accs) | -4% | Merge of 10x2MB arrays negates gains |
+
+### Reference: Mackenzie et al. (TOIS 2023)
+
+Key techniques from "Efficient DaaT and SaaT Query Evaluation for Learned Sparse Representations":
+- **u8/u16 accumulators**: 1.3-1.9x speedup on 8.8M docs from cache density
+- **Query-specific impact rescaling**: dynamic [0, Mq] → [0, 255] mapping per query
+- **Heap score caching**: avoid tie-breaking comparisons (1.1x)
+- **Anytime DaaT (clustered)**: 1.3-1.8x via document reordering + cluster-priority traversal
+- **Impact-ordered indices**: organize posting lists by score (high→low) for SaaT early termination
 
 **Finding**: SAAT's 3x per-doc advantage from batch scoring is negated by processing
 7x more data (full union of posting lists vs WAND's pruned candidates).
