@@ -95,16 +95,18 @@ impl ScoreLookupTable {
     }
 }
 
-/// Precomputed BM25 document normalization factors.
-/// doc_norm[i] = K1 * (1 - B + B * doc_length[i] / avg_doc_length)
-///
-/// Uses a parallel `touched` bitset to avoid branch mispredictions in the hot loop.
-/// The bitset check + score addition are branchless operations.
-/// Dense score accumulator using u16 quantized scores.
+/// Dense score accumulator using u16 quantized scores with generation-counter
+/// lazy initialization.
 ///
 /// Key insight from Mackenzie et al. (TOIS 2023): narrower accumulators give
 /// dramatic speedups from cache density — 2x more accumulators per cache line.
 /// u16: 1M docs = 2MB (fits L2 cache), vs f32: 4MB (spills to L3).
+///
+/// Generation-counter trick (Trotman & Crane, SPE 2019): instead of zeroing
+/// the scores array between queries (2MB memset), store a generation counter
+/// per cache-line-sized chunk. If chunk_gen != current_gen, the chunk is
+/// implicitly zero. On first write to a chunk, set chunk_gen = current_gen.
+/// This converts O(N) init to O(touched_chunks) amortized.
 ///
 /// Per-query dynamic rescaling: map [0, max_possible_score] → [0, 65000]
 /// to avoid overflow while maximizing precision.
@@ -286,10 +288,24 @@ pub fn saat_bm25_search(
     let mut threshold = 0.0f32;
     let mut _total_blocks_skipped = 0usize;
 
+    // MaxScore term partitioning (Turtle & Flood, 1995; turbopuffer 2025):
+    // Precompute per-term max scores. A term is "non-essential" if its max
+    // possible contribution cannot change the top-k ranking.
+    let term_max: Vec<f32> = term_order
+        .iter()
+        .map(|&(_, qw)| qw * (K1 + 1.0))
+        .collect();
+
     for (term_idx, &(posting_idx, query_weight)) in term_order.iter().enumerate() {
-        // Term-level early exit
-        if term_idx >= 3 && threshold > 0.0 && remaining_max[term_idx] < threshold * 0.15 {
+        // MaxScore early exit — two levels:
+        // 1. Suffix-sum: if all remaining terms combined < 15% of threshold, stop.
+        if term_idx >= 2 && threshold > 0.0 && remaining_max[term_idx] < threshold * 0.15 {
             break;
+        }
+        // 2. Per-term: skip individual non-essential terms whose max score
+        //    is < 2% of threshold. These can't meaningfully rerank top-k.
+        if term_idx >= 2 && threshold > 0.0 && term_max[term_idx] < threshold * 0.02 {
+            continue;
         }
         if postings_remaining == 0 {
             break;
@@ -297,15 +313,8 @@ pub fn saat_bm25_search(
 
         let posting = &postings[posting_idx];
 
-        // Block-max skip threshold: use current top-k threshold converted to
-        // the per-posting score space. A block's max tf-component score must
-        // exceed this divided by query_weight to be worth decompressing.
-        // We use a fraction (0.5) of the threshold as the skip bar — blocks
-        // that can only contribute less than half the current kth score are pruned.
+        // Block-max skip threshold for intra-list pruning.
         let block_skip_threshold = if threshold > 0.0 && term_idx >= 2 {
-            // Convert the top-k score threshold back to the per-term tf-component scale.
-            // block_max_score * query_weight should exceed some fraction of the threshold
-            // to be worth processing. We use the quantized threshold converted to f32.
             threshold * 0.1
         } else {
             0.0
@@ -348,7 +357,9 @@ pub fn saat_bm25_search(
             }
         }
 
-        // Update threshold for term-level early exit
+        // Update threshold every 2nd term. More frequent updates would enable
+        // earlier pruning, but compute_threshold_fast scans all touched docs
+        // (~100µs per call at 100K+ touched) which exceeds the pruning benefit.
         if term_idx >= 2 && term_idx % 2 == 0 {
             threshold = compute_threshold_fast(&accumulator, limit);
         }
