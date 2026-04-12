@@ -235,6 +235,31 @@ fn bench_inverted(c: &mut Criterion) {
         );
     }
 
+    // SAAT SIMD search benchmark
+    let mut saat_query_idx = 0usize;
+    c.bench_function(format!("invert_search_saat({TOTAL})").as_str(), |b| {
+        b.to_async(&rt).iter(|| {
+            let query = queries[saat_query_idx % queries.len()].clone();
+            saat_query_idx = saat_query_idx.wrapping_add(1);
+            let invert_index = invert_index.clone();
+            let params = params.clone();
+            let no_filter = no_filter.clone();
+            async move {
+                black_box(
+                    invert_index
+                        .bm25_search_saat(
+                            query,
+                            Arc::new(params),
+                            no_filter.clone(),
+                            Arc::new(NoOpMetricsCollector),
+                        )
+                        .await
+                        .unwrap(),
+                );
+            }
+        })
+    });
+
     let phrase_params = FtsSearchParams::new()
         .with_limit(Some(10))
         .with_phrase_slop(Some(0));

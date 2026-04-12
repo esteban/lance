@@ -125,6 +125,28 @@ To achieve 100x (5ms -> 50us), need fundamentally different approaches:
 8. **Benchmark instrumentation** — comparison count + timing breakdown in benches/inverted.rs
 9. **BinaryHeap::from(vec) rebuild** — O(n) heapify instead of O(n log n) individual pushes
 
+## Phase 4: SAAT with SIMD Batch Scoring
+
+Implemented Score-at-a-Time (SAAT) alternative search path with:
+- Dense f32 score accumulator indexed by doc_id
+- Block-by-block decompression + 8-doc batch scoring (auto-vectorizable)
+- Terms processed rarest-first for early threshold establishment
+- Block-level pruning with sampling-based accumulated score check
+
+| Path | Time | Per-Doc Cost | Docs Processed | Notes |
+|------|------|-------------|----------------|-------|
+| WAND (baseline) | 5.32 ms | 73 ns | ~73K | Block-max pruning effective |
+| SAAT batch | 11.3 ms | 23 ns | ~500K | 3x faster per doc, 7x more data |
+
+**Finding**: SAAT's 3x per-doc advantage from batch scoring is negated by processing
+7x more data (full union of posting lists vs WAND's pruned candidates).
+The WAND's block-max pruning is the dominant factor — it eliminates 93% of the work.
+
+SAAT would win when:
+- Number of terms is small (1-3) → union is similar size to WAND candidates
+- Block-max scores are uniformly high → WAND can't prune effectively
+- Scoring is the bottleneck → SIMD batch scoring dominates
+
 ## Architecture Notes
 
 The BM25 search pipeline in Lance uses **Block-Max WAND (BMW)** with:

@@ -9,6 +9,7 @@ pub mod json;
 pub mod parser;
 pub mod query;
 mod scorer;
+pub(crate) mod simd_scorer;
 pub mod tokenizer;
 mod wand;
 

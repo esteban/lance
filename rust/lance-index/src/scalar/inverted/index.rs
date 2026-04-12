@@ -587,6 +587,56 @@ impl InvertedIndex {
             .unzip())
     }
 
+    /// SAAT BM25 search: Score-at-a-Time with SIMD batch scoring.
+    /// Alternative to the default WAND path for OR queries with many terms.
+    #[instrument(level = "debug", skip_all)]
+    pub async fn bm25_search_saat(
+        &self,
+        tokens: Arc<Tokens>,
+        params: Arc<FtsSearchParams>,
+        prefilter: Arc<dyn PreFilter>,
+        metrics: Arc<dyn MetricsCollector>,
+    ) -> Result<(Vec<u64>, Vec<f32>)> {
+        let limit = params.limit.unwrap_or(usize::MAX);
+        if limit == 0 {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let mask = prefilter.mask();
+
+        let mut candidates = BinaryHeap::new();
+        // For SAAT, process partitions sequentially (single-partition is the common case)
+        for part in &self.partitions {
+            let postings = part
+                .load_posting_lists(tokens.as_ref(), params.as_ref(), metrics.as_ref())
+                .await?;
+            if postings.is_empty() {
+                continue;
+            }
+            let part = part.clone();
+            let params = params.clone();
+            let mask = mask.clone();
+            let metrics = metrics.clone();
+            let hits = spawn_cpu(move || {
+                part.bm25_search_saat(params.as_ref(), mask, postings, metrics.as_ref())
+            })
+            .await?;
+            for doc in hits {
+                if candidates.len() < limit {
+                    candidates.push(Reverse(ScoredDoc::new(doc.row_id, doc.score)));
+                } else if candidates.peek().unwrap().0.score.0 < doc.score {
+                    candidates.pop();
+                    candidates.push(Reverse(ScoredDoc::new(doc.row_id, doc.score)));
+                }
+            }
+        }
+
+        Ok(candidates
+            .into_sorted_vec()
+            .into_iter()
+            .map(|Reverse(doc)| (doc.row_id, doc.score.0))
+            .unzip())
+    }
+
     async fn load_legacy_index(
         store: Arc<dyn IndexStore>,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
@@ -1113,6 +1163,28 @@ impl InvertedPartition {
             );
         }
         Ok(hits)
+    }
+
+    /// SAAT (Score-at-a-Time) BM25 search with SIMD batch scoring.
+    /// Alternative to WAND for OR queries with many terms.
+    #[instrument(level = "debug", skip_all)]
+    pub fn bm25_search_saat(
+        &self,
+        params: &FtsSearchParams,
+        mask: Arc<RowAddrMask>,
+        postings: Vec<PostingIterator>,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<Vec<DocCandidate>> {
+        if postings.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(super::simd_scorer::saat_bm25_search(
+            &postings,
+            &self.docs,
+            params,
+            mask,
+            metrics,
+        ))
     }
 
     pub async fn into_builder(self) -> Result<InnerBuilder> {
@@ -3826,6 +3898,12 @@ impl DocSet {
     #[inline]
     pub fn num_tokens(&self, doc_id: u32) -> u32 {
         self.num_tokens[doc_id as usize]
+    }
+
+    /// Direct access to the num_tokens array for SIMD batch scoring.
+    #[inline]
+    pub fn num_tokens_slice(&self) -> &[u32] {
+        &self.num_tokens
     }
 
     // this can be used only if it's a legacy format,

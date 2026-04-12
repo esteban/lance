@@ -46,10 +46,10 @@ pub static FLAT_SEARCH_PERCENT_THRESHOLD: LazyLock<u64> = LazyLock::new(|| {
 
 pub struct PostingIterator {
     token: String,
-    token_id: u32,
+    pub(crate) token_id: u32,
     position: u32,
-    query_weight: f32,
-    list: PostingList,
+    pub(crate) query_weight: f32,
+    pub(crate) list: PostingList,
     // the index of current doc, this can be changed only by `next()`
     index: usize,
     // the index of current block, this can be changed by `next() and shallow_next()`
