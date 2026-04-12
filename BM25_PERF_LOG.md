@@ -34,3 +34,43 @@ Achieved **1.34x** speedup through:
 - **No impact**: SmallVec for freqs (allocation not dominant at this scale)
 
 Remaining 5.37ms is dominated by: WAND traversal (heap ops + block decompression + scoring)
+
+## Phase 3: Algorithmic Analysis
+
+### WAND Inner Loop Profile (15-token OR, top-10, 1M docs)
+
+| Metric | Average | Notes |
+|--------|---------|-------|
+| Inner loop iterations | 73,000 | The real work count |
+| update_max_scores calls | 591 | One per block boundary (~128-doc window) |
+| Threshold prunes | 103,000 | Docs rejected by score check |
+| Final candidates (comparisons) | 114 | Docs that pass all filters |
+| us per inner iteration | 0.073 | 5.3ms / 73K iterations |
+
+### Root Cause Analysis
+
+The WAND evaluates **73K docs per query** despite only returning 10 results.
+The "114 comparisons" metric only counts docs that pass the mask filter.
+
+With 15 Zipf-distributed terms:
+- Each term's block-max score ~1.0
+- Combined block-max across all terms ~15.0
+- Top-10 threshold ~13.0
+- Block-max sum > threshold for **almost every block**
+- Block-level pruning rarely triggers
+- Result: every doc in the union of posting lists is checked individually
+
+### Optimization Path Forward
+
+Block-level skip (implemented + tested): **no impact** because combined block-max of 15 terms always exceeds threshold.
+
+**Required approach**: MaxScore essential/non-essential term partitioning:
+- Sort terms by IDF * max_doc_weight
+- Only iterate through "essential" terms whose individual max score > threshold gap
+- Non-essential terms checked lazily only for candidates from essential terms
+- Expected reduction: 73K iterations -> ~5-10K (only essential term posting lists)
+
+Alternative: Score-at-a-Time (SAAT) with hash accumulator
+- Process one term at a time, accumulate in HashMap<u32, f32>
+- Avoids heap overhead entirely
+- Memory: O(|union of posting lists|) which can be large for Zipf

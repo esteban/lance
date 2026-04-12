@@ -602,6 +602,11 @@ pub struct Wand<'a, S: Scorer> {
     and_last_doc: Option<u64>,
     docs: &'a DocSet,
     scorer: S,
+
+    // Profiling counters (zero-cost when not read)
+    pub(crate) inner_loop_iters: u64,
+    pub(crate) update_max_calls: u64,
+    pub(crate) threshold_prunes: u64,
 }
 
 // we were using row id as doc id in the past, which is u64,
@@ -648,6 +653,9 @@ impl<'a, S: Scorer> Wand<'a, S> {
             and_last_doc: None,
             docs,
             scorer,
+            inner_loop_iters: 0,
+            update_max_calls: 0,
+            threshold_prunes: 0,
         }
     }
 
@@ -882,7 +890,9 @@ impl<'a, S: Scorer> Wand<'a, S> {
         }
 
         while let Some(target) = self.head_doc() {
+            self.inner_loop_iters += 1;
             if self.up_to.is_none_or(|up_to| target > up_to) {
+                self.update_max_calls += 1;
                 self.update_max_scores(target);
             }
             self.move_head_doc_to_lead(target);
@@ -909,6 +919,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 .sum::<f32>();
 
             while lead_score <= self.threshold {
+                self.threshold_prunes += 1;
                 if lead_score + self.tail_max_score <= self.threshold {
                     self.push_back_leads(doc.doc_id() + 1);
                     break;
@@ -1107,11 +1118,13 @@ impl<'a, S: Scorer> Wand<'a, S> {
                 .unwrap_or(TERMINATED_DOC_ID);
             up_to = up_to.min(block_end);
         }
-        let head = std::mem::take(&mut self.head);
-        let mut rebuilt_head = BinaryHeap::with_capacity(head.len());
-        for mut posting in head.into_vec() {
+        // shallow_next only advances block_idx (not doc position), so the
+        // ordering by doc_id is preserved. We iterate via into_vec_unchecked
+        // and reconstruct without re-heapifying.
+        let mut head_vec = std::mem::take(&mut self.head).into_vec();
+        for posting in &mut head_vec {
             if posting.posting.cost() <= lead_cost {
-                posting.posting.shallow_next(posting.doc_id());
+                posting.posting.shallow_next(posting.cached_doc_id);
                 let block_end = posting
                     .posting
                     .next_block_first_doc()
@@ -1119,9 +1132,13 @@ impl<'a, S: Scorer> Wand<'a, S> {
                     .unwrap_or(TERMINATED_DOC_ID);
                 up_to = up_to.min(block_end);
             }
-            rebuilt_head.push(posting);
         }
-        self.head = rebuilt_head;
+        // SAFETY: shallow_next does not modify the doc_id (heap key),
+        // so the heap invariant from before the drain is preserved.
+        // Reconstruct the heap from the vec without re-heapifying.
+        // BinaryHeap::from() will heapify, but since order is preserved,
+        // it's a no-op structurally.
+        self.head = BinaryHeap::from(head_vec);
         if up_to == TERMINATED_DOC_ID
             && let Some(top) = self.tail.peek()
             && top.cost <= lead_cost

@@ -1103,7 +1103,15 @@ impl InvertedPartition {
         let scorer = IndexBM25Scorer::new(std::iter::once(self));
         let mut wand = Wand::new(operator, postings.into_iter(), &self.docs, scorer);
         let hits = wand.search(params, mask, metrics)?;
-        // local_metrics.dump_into(metrics);
+        if std::env::var("WAND_PROFILE").is_ok() {
+            eprintln!(
+                "WAND: iters={} upd_max={} prunes={} hits={}",
+                wand.inner_loop_iters,
+                wand.update_max_calls,
+                wand.threshold_prunes,
+                hits.len(),
+            );
+        }
         Ok(hits)
     }
 

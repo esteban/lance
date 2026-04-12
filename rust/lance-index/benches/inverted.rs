@@ -20,7 +20,8 @@ use lance_index::scalar::inverted::query::{FtsSearchParams, Operator, Tokens};
 use lance_index::scalar::inverted::{InvertedIndex, InvertedIndexBuilder};
 use lance_index::scalar::lance_format::LanceIndexStore;
 use lance_index::{
-    metrics::NoOpMetricsCollector, scalar::inverted::tokenizer::InvertedIndexParams,
+    metrics::{LocalMetricsCollector, NoOpMetricsCollector},
+    scalar::inverted::tokenizer::InvertedIndexParams,
 };
 use lance_io::object_store::ObjectStore;
 use object_store::path::Path;
@@ -195,6 +196,44 @@ fn bench_inverted(c: &mut Criterion) {
             }
         })
     });
+
+    // === Profiling: measure WAND comparisons ===
+    {
+        let profile_queries = 100;
+        let mut total_comparisons = 0usize;
+        let mut total_us = 0u128;
+
+        for i in 0..profile_queries {
+            let query = queries[i % queries.len()].clone();
+            let metrics = Arc::new(LocalMetricsCollector::default());
+            rt.block_on(async {
+                let t0 = std::time::Instant::now();
+                let _ = invert_index
+                    .bm25_search(
+                        query,
+                        Arc::new(params.clone()),
+                        Operator::Or,
+                        no_filter.clone(),
+                        metrics.clone(),
+                    )
+                    .await
+                    .unwrap();
+                total_us += t0.elapsed().as_micros();
+            });
+            total_comparisons +=
+                metrics.comparisons.load(std::sync::atomic::Ordering::Relaxed);
+        }
+
+        let avg_comparisons = total_comparisons as f64 / profile_queries as f64;
+        let avg_us = total_us as f64 / profile_queries as f64;
+        eprintln!(
+            "\n=== WAND Profile (15-token OR, top-10, {TOTAL} docs) ===\n\
+             avg comparisons: {avg_comparisons:.1}\n\
+             avg query: {avg_us:.0} us\n\
+             us/comparison: {:.1}\n",
+            avg_us / avg_comparisons,
+        );
+    }
 
     let phrase_params = FtsSearchParams::new()
         .with_limit(Some(10))
