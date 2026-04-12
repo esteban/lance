@@ -295,15 +295,18 @@ pub fn saat_bm25_search(
     let mut quantized_lut_buf = vec![0u16; MAX_FREQ_LUT * NUM_DL_BUCKETS];
     let mut num_comparisons = 0usize;
 
-    // Heuristic: scale with limit/term count, but keep at least a 100K postings floor.
-    // For the current top-10 query mix (3-15 terms), that floor dominates.
-    // Validated at 89.2% recall across 200 corpus-wide queries on a 100K-doc Zipf corpus
-    // (see test_saat_vs_wand_correctness). Both budget and the 0.15 suffix-sum threshold
-    // are sensitive knobs — re-validate if either the corpus distribution or limit changes.
+    // Total postings budget — heuristic floor of 100K.
     let postings_budget = (10 * limit * term_order.len()).max(100_000);
     let mut postings_remaining = postings_budget;
     let mut threshold = 0.0f32;
     let mut _total_blocks_skipped = 0usize;
+
+    // Geometric budget decay: after processing each term, reduce the remaining
+    // budget by a decay factor. This gives early terms (rare, discriminative)
+    // more postings and later terms (common, less informative) fewer postings.
+    // The decay is softer than hard per-term caps — it doesn't waste budget
+    // when rare terms have short posting lists.
+    let budget_decay: f32 = 0.95;
 
     // MaxScore term partitioning (Turtle & Flood, 1995; turbopuffer 2025):
     // Precompute per-term max scores. A term is "non-essential" if its max
@@ -385,6 +388,15 @@ pub fn saat_bm25_search(
                 num_comparisons += to_process;
                 postings_remaining = postings_remaining.saturating_sub(to_process);
             }
+        }
+
+        // Geometric budget decay: reduce remaining budget after each term.
+        // Early terms (rare) get full budget; later terms (common) get
+        // geometrically decreasing budgets. With decay=0.85 and 15 terms,
+        // term 14 gets ~10% of the original budget.
+        if term_idx >= 2 {
+            postings_remaining =
+                (postings_remaining as f32 * budget_decay) as usize;
         }
 
         // Update threshold every 2nd term. More frequent updates would enable
