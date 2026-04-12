@@ -74,3 +74,38 @@ Alternative: Score-at-a-Time (SAAT) with hash accumulator
 - Process one term at a time, accumulate in HashMap<u32, f32>
 - Avoids heap overhead entirely
 - Memory: O(|union of posting lists|) which can be large for Zipf
+
+### Attempted Optimizations (Phase 3, ineffective)
+
+| Attempt | Why Ineffective |
+|---------|----------------|
+| Block-level skip on prune | Combined block-max of 15 terms (~15) > threshold (~13) |
+| MaxScore term repartitioning | Only 1-3 terms moved; existing tail overflow logic conflicts |
+| BinaryHeap::from(vec) rebuild | O(n) vs O(n log n) but n=15 is too small to matter |
+
+### Per-Iteration Analysis
+
+At 73K iterations / 5.3ms = **73ns per iteration**. This includes:
+- BinaryHeap peek/pop/push: O(log 15) ~ 4 operations
+- Score computation: O(|lead|) ~ 1-3 multiplications
+- Threshold check + push_back_leads: O(|lead| x log 15)
+
+**73ns for ~60 operations = ~1.2ns per operation** — this is near-optimal for modern CPUs.
+The WAND is already well-optimized per-iteration. The 73K iteration count is inherent
+to the DAAT + block-max approach with 15 terms on Zipf data.
+
+### True 100x Path
+
+To achieve 100x (5ms -> 50us), need fundamentally different approaches:
+1. **Precomputed impact-ordered indices**: Store docs sorted by BM25 impact per term, enabling early termination after scanning top-impact blocks
+2. **WAND with larger blocks**: 1024 instead of 128 would reduce update_max_scores from 600 to 75 calls (format change)
+3. **Query-time term elimination**: For top-10 queries, terms beyond the top-3 by IDF contribute <10% of final score; can be deferred to re-scoring
+4. **SIMD batch scoring**: Process 8 docs simultaneously using AVX2
+5. **Tiered index**: Pre-cluster docs by quality, search high-quality tier first
+
+## Current State
+
+| Benchmark | Baseline | Current | Speedup |
+|-----------|----------|---------|---------|
+| invert_search(1M) | 7.17 ms | 5.32 ms | **1.35x** |
+| invert_phrase_search(1M) | 12.84 ms | 12.22 ms | **1.05x** |
