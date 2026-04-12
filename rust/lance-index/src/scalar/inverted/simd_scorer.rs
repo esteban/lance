@@ -373,6 +373,8 @@ pub fn saat_bm25_search(
     let mut buffer = DecodeBuffer::new();
     let mut num_comparisons = 0usize;
 
+    // TODO(Codex): Re-validate these heuristics on representative queries before
+    // treating SAAT latency as a launch metric. Recall is sensitive to both knobs.
     // Anytime postings budget: adaptive to query complexity.
     // For top-10 with 10 terms, 200K postings ≈ 20K per term on average.
     let postings_budget = (10 * limit * term_order.len()).max(50_000);

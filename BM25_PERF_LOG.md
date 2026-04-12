@@ -110,7 +110,16 @@ To achieve 100x (5ms -> 50us), need fundamentally different approaches:
 | Baseline WAND | 7.17 ms | 1.00x | Original |
 | Optimized WAND | 5.32 ms | 1.35x | Phase 2 Rust-level opts |
 | SAAT (all opts) | **776 µs** | **9.2x** | LUT + u16 + anytime ρ=50K |
-| SAAT (ρ=25K) | **1.25 ms** | **5.7x** | More conservative budget |
+| SAAT (ρ=25K) | **1.25 ms** | **5.7x** | More aggressive cutoff; likely lower recall |
+
+### Codex Review Notes (2026-04-12)
+
+Author: Codex
+
+- The SAAT latency rows above should be read as **single-partition** numbers after correctness fix `d23c4a2fb`; multi-partition queries now fall back to exact `bm25_search` to preserve global BM25 scoring.
+- The benchmark harness currently generates 15-token queries from `doc_col.value(0)` only. This is useful for iteration, but it is not strong enough evidence to generalize the reported speedups or recall to the full corpus distribution.
+- The current automated recall evidence is a smoke test, not a launch-grade guarantee: `test_saat_vs_wand_correctness` only enforces average recall@10 >= 70%.
+- Before presenting SAAT as "very close" to WAND, re-validate latency and recall on a representative query set sampled across the corpus and tighten the acceptable recall threshold accordingly.
 
 ### Progression of SAAT Optimization (branch: perf/bm25-simd-format)
 
