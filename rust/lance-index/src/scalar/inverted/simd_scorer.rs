@@ -4,12 +4,36 @@
 //! SIMD-accelerated BM25 scoring for full-text search.
 //!
 //! Score-at-a-Time (SAAT) BM25 with:
-//! - Precomputed doc_norm array (eliminates per-doc-per-term recomputation)
-//! - Dense f32 accumulator with branchless updates
+//! - Per-term quantized u16 LUT (fuses query_weight x scale into table lookup)
+//! - Dense u16 accumulator with branchless saturating add (32 docs/cache line)
 //! - Multi-block decode buffers (4 blocks = 512 docs per decode batch)
-//! - Block-level pruning using accumulated score bounds
-//! - Parallel term processing via rayon
-//! - Auto-vectorizable 8-wide scoring loops (NEON/AVX2)
+//! - Geometric budget decay (0.95x per term, replaces threshold-based pruning)
+//! - 8-wide unrolled scoring loops (scalar ILP, not SIMD -- gather prevents vectorization)
+//!
+//! ## Assembly verification (aarch64, release, 2026-04-12)
+//!
+//! Inner loop compiles to scalar ARM instructions per posting:
+//!   Bucket: FMUL + FCVTZU + CMP + CSEL (4 insns, branchless min)
+//!   LUT index: MADD + LSR + CBNZ (3 insns, bounds check)
+//!   LUT load: LDRH (1 insn, u16 from quantized table)
+//!   Accumulate: LDRH + ADD + CMP + CSEL + STRH (5 insns, sat add)
+//!   Total: ~13 instructions per posting (quantized LUT path).
+//!
+//! NEON auto-vectorization does NOT occur -- random doc_id indexing into
+//! num_tokens[] and scores[] prevents gather/scatter vectorization.
+//!
+//! ## Cache-line analysis (Apple M-series, 64B lines)
+//!
+//! | Structure     | Size  | Cache | Access     | Bottleneck |
+//! |---------------|-------|-------|------------|------------|
+//! | scores (u16)  | 2 MB  | L2    | Random     | Medium     |
+//! | touched_bits  | 122KB | L1    | Random     | No         |
+//! | num_tokens    | 4 MB  | L2    | Random     | YES        |
+//! | quantized_lut | 32 KB | L1    | Random     | No         |
+//! | decode bufs   | 4 KB  | L1    | Sequential | No         |
+//!
+//! Primary bottleneck: num_tokens[doc_id] (4MB u32 array). Could halve
+//! to 2MB with u16 packing but requires DocSet changes.
 
 use std::sync::Arc;
 
