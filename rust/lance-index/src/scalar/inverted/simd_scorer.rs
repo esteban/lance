@@ -32,8 +32,12 @@
 //! | quantized_lut | 32 KB | L1    | Random     | No         |
 //! | decode bufs   | 4 KB  | L1    | Sequential | No         |
 //!
-//! Primary bottleneck: num_tokens[doc_id] (4MB u32 array). Could halve
-//! to 2MB with u16 packing but requires DocSet changes.
+//! Primary bottleneck: num_tokens[doc_id] (4MB u32 array).
+//!
+//! TESTED and REJECTED: precomputed u8 doc_buckets array (1MB).
+//! - Per-query precompute: +8.5% regression (1.6ms build > 0.13ms savings).
+//! - Cached at DocSet load: +3% regression vs baseline. Loop is memory-latency-
+//!   bound; 4 saved FP insns hide behind L2 access. Extra 1MB adds cache pressure.
 
 use std::sync::Arc;
 
