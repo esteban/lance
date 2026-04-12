@@ -2,8 +2,8 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::fmt::{Debug, Display};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
 use std::{
     cmp::{Reverse, min},
     collections::BinaryHeap,
@@ -1200,7 +1200,7 @@ impl InvertedPartition {
     }
 
     /// SAAT search with pre-built LUT (avoids per-query LUT construction).
-    pub fn bm25_search_saat_with_lut(
+    pub(crate) fn bm25_search_saat_with_lut(
         &self,
         params: &FtsSearchParams,
         mask: Arc<RowAddrMask>,
@@ -4353,7 +4353,7 @@ mod tests {
     use arrow_array::{ArrayRef, Float32Array, RecordBatch, StringArray, UInt32Array, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
     use std::collections::HashMap;
-    use std::sync::{Arc, OnceLock};
+    use std::sync::Arc;
 
     use super::*;
 

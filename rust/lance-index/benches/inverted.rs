@@ -222,8 +222,9 @@ fn bench_inverted(c: &mut Criterion) {
                     .unwrap();
                 total_us += t0.elapsed().as_micros();
             });
-            total_comparisons +=
-                metrics.comparisons.load(std::sync::atomic::Ordering::Relaxed);
+            total_comparisons += metrics
+                .comparisons
+                .load(std::sync::atomic::Ordering::Relaxed);
         }
 
         let avg_comparisons = total_comparisons as f64 / profile_queries as f64;

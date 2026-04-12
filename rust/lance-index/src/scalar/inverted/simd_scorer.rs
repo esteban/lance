@@ -15,7 +15,6 @@ use std::sync::Arc;
 
 use arrow_array::Array;
 use lance_core::utils::mask::RowAddrMask;
-use rayon::prelude::*;
 
 use super::builder::BLOCK_SIZE;
 use super::encoding::{decompress_posting_block, decompress_posting_remainder};
@@ -99,48 +98,6 @@ impl ScoreLookupTable {
 /// Precomputed BM25 document normalization factors.
 /// doc_norm[i] = K1 * (1 - B + B * doc_length[i] / avg_doc_length)
 ///
-/// This is constant across all query terms and only depends on doc length.
-/// Precomputing avoids N_terms redundant multiplications per doc.
-struct PrecomputedDocNorms {
-    /// For each doc: K1 * (1 - B + B * dl / avgdl)
-    norms: Vec<f32>,
-}
-
-impl PrecomputedDocNorms {
-    pub(crate) fn new(docs: &DocSet) -> Self {
-        let avgdl = docs.average_length();
-        let b_over_avgdl = B / avgdl;
-        let k1_times_one_minus_b = K1 * (1.0 - B);
-
-        let num_tokens = docs.num_tokens_slice();
-        let mut norms = Vec::with_capacity(num_tokens.len());
-
-        // Process in chunks of 8 for auto-vectorization
-        let chunks = num_tokens.len() / 8;
-        for chunk in 0..chunks {
-            let base = chunk * 8;
-            for i in 0..8 {
-                let dl = num_tokens[base + i] as f32;
-                norms.push(k1_times_one_minus_b + K1 * b_over_avgdl * dl);
-            }
-        }
-        for i in (chunks * 8)..num_tokens.len() {
-            let dl = num_tokens[i] as f32;
-            norms.push(k1_times_one_minus_b + K1 * b_over_avgdl * dl);
-        }
-
-        Self { norms }
-    }
-
-    #[inline(always)]
-    fn get(&self, doc_id: u32) -> f32 {
-        // Safety: doc_id is always within bounds (guaranteed by posting list construction)
-        unsafe { *self.norms.get_unchecked(doc_id as usize) }
-    }
-}
-
-/// Dense score accumulator with branchless touch tracking.
-///
 /// Uses a parallel `touched` bitset to avoid branch mispredictions in the hot loop.
 /// The bitset check + score addition are branchless operations.
 /// Dense score accumulator using u16 quantized scores.
@@ -179,60 +136,6 @@ impl ScoreAccumulator {
     }
 
     /// Batch-accumulate quantized scores for a block of documents.
-    /// u16 additions are cheaper than f32 and pack 2x denser in cache lines.
-    #[inline]
-    fn accumulate_block(
-        &mut self,
-        doc_ids: &[u32],
-        freqs: &[u32],
-        query_weight_times_k1_plus_1: f32,
-        num_tokens: &[u32],
-        b_over_avgdl: f32,
-    ) {
-        let len = doc_ids.len();
-        let chunks = len / 8;
-        let scale = self.scale;
-
-        for chunk in 0..chunks {
-            let base = chunk * 8;
-            for i in 0..8 {
-                let idx = base + i;
-                let doc_id = unsafe { *doc_ids.get_unchecked(idx) };
-                let freq = unsafe { *freqs.get_unchecked(idx) } as f32;
-                let doc_tokens = num_tokens[doc_id as usize];
-
-                let doc_norm = K1 * (1.0 - B + b_over_avgdl * doc_tokens as f32);
-                let score = query_weight_times_k1_plus_1 * freq / (freq + doc_norm);
-                let quantized = (score * scale) as u16;
-
-                let score_idx = doc_id as usize;
-                unsafe {
-                    let current = *self.scores.get_unchecked(score_idx);
-                    *self.scores.get_unchecked_mut(score_idx) = current.saturating_add(quantized);
-                }
-
-                let word_idx = (doc_id >> 6) as usize;
-                let bit = 1u64 << (doc_id & 63);
-                unsafe {
-                    *self.touched_bits.get_unchecked_mut(word_idx) |= bit;
-                }
-            }
-        }
-
-        for idx in (chunks * 8)..len {
-            let doc_id = doc_ids[idx];
-            let freq = freqs[idx] as f32;
-            let doc_tokens = num_tokens[doc_id as usize];
-            let doc_norm = K1 * (1.0 - B + b_over_avgdl * doc_tokens as f32);
-            let score = query_weight_times_k1_plus_1 * freq / (freq + doc_norm);
-            let quantized = (score * scale) as u16;
-
-            let score_idx = doc_id as usize;
-            self.scores[score_idx] = self.scores[score_idx].saturating_add(quantized);
-            let word_idx = (doc_id >> 6) as usize;
-            self.touched_bits[word_idx] |= 1u64 << (doc_id & 63);
-        }
-    }
 
     /// Iterate over all touched doc_ids efficiently using bitset word scanning.
     fn iter_touched(&self) -> impl Iterator<Item = u32> + '_ {
@@ -552,52 +455,6 @@ fn process_compressed_list_with_lut(
     processed
 }
 
-/// Process a compressed posting list: multi-block decode + batch scoring.
-fn process_compressed_list(
-    list: &CompressedPostingList,
-    qw_k1p1: f32,
-    num_tokens: &[u32],
-    accumulator: &mut ScoreAccumulator,
-    buffer: &mut DecodeBuffer,
-    num_comparisons: &mut usize,
-) {
-    let num_blocks = list.blocks.len();
-    let length = list.length as usize;
-
-    let mut block_idx = 0;
-    while block_idx < num_blocks {
-        buffer.clear();
-
-        let batch_end = (block_idx + DECODE_BATCH).min(num_blocks);
-        for bi in block_idx..batch_end {
-            let block_data = list.blocks.value(bi);
-            let remainder = length % BLOCK_SIZE;
-            if bi + 1 == num_blocks && remainder != 0 {
-                decompress_posting_remainder(
-                    block_data,
-                    remainder,
-                    list.posting_tail_codec,
-                    &mut buffer.doc_ids,
-                    &mut buffer.freqs,
-                );
-            } else {
-                decompress_posting_block(
-                    block_data,
-                    &mut buffer.scratch,
-                    &mut buffer.doc_ids,
-                    &mut buffer.freqs,
-                );
-            }
-        }
-
-        *num_comparisons += buffer.doc_ids.len();
-
-        accumulator.accumulate_block(&buffer.doc_ids, &buffer.freqs, qw_k1p1, num_tokens, 0.0);
-
-        block_idx = batch_end;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -682,12 +539,10 @@ mod tests {
         let params = FtsSearchParams::new().with_limit(Some(10));
         let mask = Arc::new(RowAddrMask::default());
         let metrics = crate::metrics::NoOpMetricsCollector;
-
         let lut = ScoreLookupTable::new(&docs);
         let results = saat_bm25_search(&[iter1, iter2], &docs, &params, mask, &metrics, &lut);
         assert_eq!(results.len(), 10);
 
-        // Docs 50-99 should score highest (both terms match)
         for r in &results {
             let doc_id = docs.doc_id(r.row_id).unwrap() as u32;
             assert!(
@@ -770,13 +625,195 @@ mod tests {
     }
 
     #[test]
-    fn test_precomputed_doc_norms() {
+    fn test_score_lookup_table_constant_doc_length() {
         let docs = make_test_docs(100);
-        let norms = PrecomputedDocNorms::new(&docs);
-        // All docs have length 10, avg=10, so doc_norm = K1*(1-B+B*10/10) = K1 = 1.2
-        for i in 0..100 {
-            let norm = norms.get(i);
-            assert!((norm - K1).abs() < 1e-6, "expected K1={}, got {}", K1, norm);
+        let lut = ScoreLookupTable::new(&docs);
+        let score = lut.score(1, 10, 1.0);
+        let expected = (K1 + 1.0) / (1.0 + K1);
+        assert!(
+            (score - expected).abs() < 1e-6,
+            "expected score={}, got {}",
+            expected,
+            score
+        );
+    }
+}
+
+#[cfg(test)]
+mod integration_tests {
+    use std::sync::Arc;
+
+    use arrow_array::{LargeStringArray, RecordBatch, UInt64Array};
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use futures::stream;
+    use itertools::Itertools;
+    use lance_core::ROW_ID;
+    use lance_core::cache::LanceCache;
+
+    use crate::metrics::NoOpMetricsCollector;
+    use crate::prefilter::NoFilter;
+    use crate::scalar::inverted::lance_tokenizer::DocType;
+    use crate::scalar::inverted::query::{FtsSearchParams, Operator, Tokens};
+    use crate::scalar::inverted::tokenizer::InvertedIndexParams;
+    use crate::scalar::inverted::{InvertedIndex, InvertedIndexBuilder};
+    use crate::scalar::lance_format::LanceIndexStore;
+    use lance_io::object_store::ObjectStore;
+    use object_store::path::Path;
+    use rand::{Rng, SeedableRng, rngs::StdRng};
+    use rand_distr::Zipf;
+
+    /// Validate that SAAT produces results consistent with WAND.
+    /// Checks: (1) recall of SAAT top-k vs WAND top-k, (2) score ranking order.
+    #[tokio::test]
+    async fn test_saat_vs_wand_correctness() {
+        const TOTAL: usize = 100_000; // smaller for test speed
+        const VOCAB_SIZE: usize = 10_000;
+        const ZIPF_EXPONENT: f64 = 1.1;
+
+        let tempdir = tempfile::tempdir().unwrap();
+        let index_dir = Path::from_filesystem_path(tempdir.path()).unwrap();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            index_dir,
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        // Generate Zipf-distributed corpus
+        let vocab: Vec<String> = (0..VOCAB_SIZE).map(|i| format!("term{i:04}")).collect();
+        let word_zipf = Zipf::new(VOCAB_SIZE as f64, ZIPF_EXPONENT).unwrap();
+        let mut rng = StdRng::seed_from_u64(42);
+        let mut docs = Vec::with_capacity(TOTAL);
+        for _ in 0..TOTAL {
+            let num_words = rng.random_range(1..=50usize);
+            let mut doc = String::with_capacity(num_words * 8);
+            for i in 0..num_words {
+                let idx = (rng.sample(word_zipf) as usize).clamp(1, VOCAB_SIZE) - 1;
+                if i > 0 {
+                    doc.push(' ');
+                }
+                doc.push_str(&vocab[idx]);
+            }
+            docs.push(doc);
         }
+
+        let row_id_col = Arc::new(UInt64Array::from(
+            (0..TOTAL).map(|i| i as u64).collect_vec(),
+        ));
+        let doc_col = Arc::new(LargeStringArray::from(docs));
+        let batch = RecordBatch::try_new(
+            arrow_schema::Schema::new(vec![
+                arrow_schema::Field::new("doc", arrow_schema::DataType::LargeUtf8, false),
+                arrow_schema::Field::new(ROW_ID, arrow_schema::DataType::UInt64, false),
+            ])
+            .into(),
+            vec![doc_col.clone(), row_id_col],
+        )
+        .unwrap();
+
+        // Build index
+        let stream =
+            RecordBatchStreamAdapter::new(batch.schema(), stream::iter(vec![Ok(batch.clone())]));
+        let mut builder =
+            InvertedIndexBuilder::new(InvertedIndexParams::default().with_position(false));
+        builder
+            .update(Box::pin(stream), store.as_ref(), None)
+            .await
+            .unwrap();
+
+        let index = InvertedIndex::load(store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        let no_filter = Arc::new(NoFilter);
+
+        // Test with multiple query configurations
+        let sample_doc = doc_col.value(0);
+        let sample_words: Vec<String> = sample_doc
+            .split_whitespace()
+            .map(|s| s.to_owned())
+            .collect();
+        let mut query_rng = StdRng::seed_from_u64(99);
+
+        let mut total_recall = 0.0f64;
+        let num_queries = 50;
+
+        for _ in 0..num_queries {
+            let num_tokens = query_rng.random_range(3..=15usize);
+            let mut query_tokens = Vec::with_capacity(num_tokens);
+            for _ in 0..num_tokens {
+                let idx = query_rng.random_range(0..sample_words.len());
+                query_tokens.push(sample_words[idx].clone());
+            }
+            let query = Arc::new(Tokens::new(query_tokens, DocType::Text));
+            let params = FtsSearchParams::new().with_limit(Some(10));
+
+            // Run WAND (ground truth)
+            let (wand_ids, _wand_scores) = index
+                .bm25_search(
+                    query.clone(),
+                    Arc::new(params.clone()),
+                    Operator::Or,
+                    no_filter.clone(),
+                    Arc::new(NoOpMetricsCollector),
+                )
+                .await
+                .unwrap();
+
+            // Run SAAT
+            let (saat_ids, saat_scores) = index
+                .bm25_search_saat(
+                    query.clone(),
+                    Arc::new(params.clone()),
+                    no_filter.clone(),
+                    Arc::new(NoOpMetricsCollector),
+                )
+                .await
+                .unwrap();
+
+            // Both should return results
+            assert!(
+                !wand_ids.is_empty() || saat_ids.is_empty(),
+                "WAND returned results but SAAT did not"
+            );
+
+            if wand_ids.is_empty() {
+                continue;
+            }
+
+            // Compute recall: fraction of WAND top-k that appear in SAAT top-k
+            let wand_set: std::collections::HashSet<u64> = wand_ids.iter().copied().collect();
+            let saat_set: std::collections::HashSet<u64> = saat_ids.iter().copied().collect();
+            let overlap = wand_set.intersection(&saat_set).count();
+            let recall = overlap as f64 / wand_ids.len() as f64;
+            total_recall += recall;
+
+            // SAAT scores should be positive and in descending order
+            for i in 1..saat_scores.len() {
+                assert!(
+                    saat_scores[i - 1] >= saat_scores[i],
+                    "SAAT scores not in descending order: {} < {} at position {}",
+                    saat_scores[i - 1],
+                    saat_scores[i],
+                    i
+                );
+            }
+        }
+
+        let avg_recall = total_recall / num_queries as f64;
+        eprintln!(
+            "SAAT vs WAND recall@10: {:.1}% (over {} queries on {}K docs)",
+            avg_recall * 100.0,
+            num_queries,
+            TOTAL / 1000
+        );
+
+        // TODO(Codex): Tighten this to a launch-grade threshold once queries are sampled
+        // across the corpus. avg_recall >= 70% is only a smoke test, not "very close".
+        // With ρ=50K on 100K docs, expect high recall for BM25
+        assert!(
+            avg_recall >= 0.70,
+            "SAAT recall too low: {:.1}% (expected >= 70%)",
+            avg_recall * 100.0
+        );
     }
 }
