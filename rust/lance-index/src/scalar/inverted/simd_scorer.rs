@@ -93,6 +93,22 @@ impl ScoreLookupTable {
             query_weight * (K1 + 1.0) * f / (f + doc_norm)
         }
     }
+
+    /// Fill a pre-allocated per-term quantized u16 LUT that fuses:
+    ///   score = LUT[freq][bucket] * query_weight * scale → u16
+    /// into a single table lookup. Eliminates 2 float multiplies + 1 cast
+    /// from the scoring hot loop (BM25S eager scoring concept, arXiv 2024).
+    ///
+    /// The buffer has layout: [freq * NUM_DL_BUCKETS + bucket] → u16
+    /// Same dimensions as the f32 table but with query_weight × scale baked in.
+    /// Reuses a pre-allocated buffer to avoid per-term allocation.
+    fn fill_quantized_term_lut(&self, query_weight: f32, scale: f32, out: &mut [u16]) {
+        let combined = query_weight * scale;
+        for (dst, &tf) in out.iter_mut().zip(self.table.iter()) {
+            let score = tf * combined;
+            *dst = (score as u32).min(65535) as u16;
+        }
+    }
 }
 
 /// Dense score accumulator using u16 quantized scores with generation-counter
@@ -276,6 +292,7 @@ pub fn saat_bm25_search(
     let max_possible_score = remaining_max[0];
     let mut accumulator = ScoreAccumulator::new(num_docs, max_possible_score);
     let mut buffer = DecodeBuffer::new();
+    let mut quantized_lut_buf = vec![0u16; MAX_FREQ_LUT * NUM_DL_BUCKETS];
     let mut num_comparisons = 0usize;
 
     // Heuristic: scale with limit/term count, but keep at least a 100K postings floor.
@@ -320,6 +337,11 @@ pub fn saat_bm25_search(
             0.0
         };
 
+        // Fill per-term quantized u16 LUT: fuses query_weight × scale into table.
+        // 64 × 256 entries × 2 bytes = 32KB — fits in L1 cache.
+        // Buffer pre-allocated outside loop to avoid per-term allocation.
+        lut.fill_quantized_term_lut(query_weight, accumulator.scale, &mut quantized_lut_buf);
+
         match &posting.list {
             PostingList::Compressed(list) => {
                 let (processed, skipped) = process_compressed_list_with_lut(
@@ -331,23 +353,31 @@ pub fn saat_bm25_search(
                     &mut buffer,
                     postings_remaining,
                     block_skip_threshold,
+                    &quantized_lut_buf,
                 );
                 num_comparisons += processed;
                 _total_blocks_skipped += skipped;
                 postings_remaining = postings_remaining.saturating_sub(processed);
             }
             PostingList::Plain(list) => {
-                let scale = accumulator.scale;
                 let to_process = list.row_ids.len().min(postings_remaining);
+                let dl_scale = lut.dl_scale;
+                let num_dl_buckets = lut.num_dl_buckets;
                 for i in 0..to_process {
                     let row_id = list.row_ids[i];
                     let Some(doc_id) = docs.doc_index_by_row_id(row_id) else {
                         continue;
                     };
-                    let freq = list.frequencies[i] as u32;
+                    let freq = list.frequencies[i] as usize;
                     let doc_tokens = num_tokens[doc_id as usize];
-                    let score = lut.score(freq, doc_tokens, query_weight);
-                    let quantized = (score * scale) as u16;
+                    let quantized = if freq < MAX_FREQ_LUT {
+                        let bucket =
+                            ((doc_tokens as f32 * dl_scale) as usize).min(num_dl_buckets - 1);
+                        quantized_lut_buf[freq * num_dl_buckets + bucket]
+                    } else {
+                        let score = lut.score(freq as u32, doc_tokens, query_weight);
+                        (score * accumulator.scale) as u16
+                    };
                     let idx = doc_id as usize;
                     accumulator.scores[idx] = accumulator.scores[idx].saturating_add(quantized);
                     accumulator.touched_bits[(doc_id >> 6) as usize] |= 1u64 << (doc_id & 63);
@@ -425,10 +455,12 @@ fn process_compressed_list_with_lut(
     buffer: &mut DecodeBuffer,
     postings_budget: usize,
     block_skip_threshold: f32,
+    quantized_lut: &[u16],
 ) -> (usize, usize) {
     let num_blocks = list.blocks.len();
     let length = list.length as usize;
-    let scale = accumulator.scale;
+    let dl_scale = lut.dl_scale;
+    let num_dl_buckets = lut.num_dl_buckets;
     let mut processed = 0usize;
     let mut blocks_skipped = 0usize;
 
@@ -469,12 +501,11 @@ fn process_compressed_list_with_lut(
             }
         }
 
-        // Score using LUT — replaces f32 division with table lookup.
-        // NOTE: Software prefetch tested and REJECTED — Apple Silicon's hardware
-        // prefetcher already handles the doc_id → num_tokens/scores random access.
-        // 16 PRFM instructions per 8-doc chunk added more overhead than they saved
-        // (1.35ms vs 1.30ms baseline). The sorted, delta-encoded doc_ids within
-        // each block provide enough locality for the hardware prefetcher.
+        // Score using per-term quantized u16 LUT (BM25S eager scoring concept).
+        // The quantized_lut fuses: LUT[freq][bucket] * query_weight * scale → u16
+        // into a single table lookup, eliminating 2 float multiplies + 1 f32→u16 cast
+        // from the hot loop. Each posting now costs: 1 bucket computation + 1 u16 load
+        // + 1 saturating_add (vs 1 f32 load + 2 f32 mul + 1 cast + 1 sat_add before).
         let len = buffer.doc_ids.len().min(postings_budget - processed);
         let chunks = len / 8;
         for chunk in 0..chunks {
@@ -482,10 +513,18 @@ fn process_compressed_list_with_lut(
             for i in 0..8 {
                 let idx = base + i;
                 let doc_id = unsafe { *buffer.doc_ids.get_unchecked(idx) };
-                let freq = unsafe { *buffer.freqs.get_unchecked(idx) };
+                let freq = unsafe { *buffer.freqs.get_unchecked(idx) } as usize;
                 let doc_tokens = num_tokens[doc_id as usize];
-                let score = lut.score(freq, doc_tokens, query_weight);
-                let quantized = (score * scale) as u16;
+                // Direct u16 LUT lookup — no float multiply
+                let quantized = if freq < MAX_FREQ_LUT {
+                    let bucket =
+                        ((doc_tokens as f32 * dl_scale) as usize).min(num_dl_buckets - 1);
+                    unsafe { *quantized_lut.get_unchecked(freq * num_dl_buckets + bucket) }
+                } else {
+                    // Fallback for rare high-frequency terms
+                    let score = lut.score(freq as u32, doc_tokens, query_weight);
+                    (score * accumulator.scale) as u16
+                };
 
                 let score_idx = doc_id as usize;
                 unsafe {
@@ -500,10 +539,15 @@ fn process_compressed_list_with_lut(
         }
         for idx in (chunks * 8)..len {
             let doc_id = buffer.doc_ids[idx];
-            let freq = buffer.freqs[idx];
+            let freq = buffer.freqs[idx] as usize;
             let doc_tokens = num_tokens[doc_id as usize];
-            let score = lut.score(freq, doc_tokens, query_weight);
-            let quantized = (score * scale) as u16;
+            let quantized = if freq < MAX_FREQ_LUT {
+                let bucket = ((doc_tokens as f32 * dl_scale) as usize).min(num_dl_buckets - 1);
+                unsafe { *quantized_lut.get_unchecked(freq * num_dl_buckets + bucket) }
+            } else {
+                let score = lut.score(freq as u32, doc_tokens, query_weight);
+                (score * accumulator.scale) as u16
+            };
             accumulator.scores[doc_id as usize] =
                 accumulator.scores[doc_id as usize].saturating_add(quantized);
             accumulator.touched_bits[(doc_id >> 6) as usize] |= 1u64 << (doc_id & 63);
