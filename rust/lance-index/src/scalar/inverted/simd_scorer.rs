@@ -322,7 +322,7 @@ pub fn saat_bm25_search(
 
         match &posting.list {
             PostingList::Compressed(list) => {
-                let (processed, _skipped) = process_compressed_list_with_lut(
+                let processed = process_compressed_list_with_lut(
                     list,
                     query_weight,
                     num_tokens,
@@ -330,7 +330,6 @@ pub fn saat_bm25_search(
                     &mut accumulator,
                     &mut buffer,
                     postings_remaining,
-                    0.0, // block-max skip disabled (threshold=0)
                     &quantized_lut_buf,
                 );
                 num_comparisons += processed;
@@ -387,22 +386,9 @@ pub fn saat_bm25_search(
 #[allow(dead_code)]
 fn _threshold_removed() {}
 
-/// Read the block-max score from the first 4 bytes of a compressed block.
-/// The block format stores max_block_score as f32 LE at offset 0.
-#[inline(always)]
-fn read_block_max_score(block_data: &[u8]) -> f32 {
-    debug_assert!(block_data.len() >= 4);
-    f32::from_le_bytes([block_data[0], block_data[1], block_data[2], block_data[3]])
-}
-
-/// Process a compressed posting list with block-level pruning.
-/// Only decompress blocks where the block-max score contribution
-/// exceeds the threshold gap for any doc in that block.
-///
-/// Block-max pruning (Ding & Suel, SIGIR 2011): each compressed block stores
-/// the maximum BM25 tf-component score for any doc in that block. If
-/// `block_max * query_weight` < current top-k threshold gap, the entire block
-/// can be skipped without decompression.
+/// Process a compressed posting list with batch decompression and scoring.
+/// Decompresses DECODE_BATCH blocks at a time (512 docs) and scores using
+/// the precomputed per-term quantized u16 LUT.
 ///
 /// Returns the number of postings processed.
 fn process_compressed_list_with_lut(
@@ -413,34 +399,21 @@ fn process_compressed_list_with_lut(
     accumulator: &mut ScoreAccumulator,
     buffer: &mut DecodeBuffer,
     postings_budget: usize,
-    block_skip_threshold: f32,
     quantized_lut: &[u16],
-) -> (usize, usize) {
+) -> usize {
     let num_blocks = list.blocks.len();
     let length = list.length as usize;
     let dl_scale = lut.dl_scale;
     let num_dl_buckets = lut.num_dl_buckets;
     let mut processed = 0usize;
-    let mut blocks_skipped = 0usize;
 
     let mut block_idx = 0;
     while block_idx < num_blocks && processed < postings_budget {
         buffer.clear();
 
         let batch_end = (block_idx + DECODE_BATCH).min(num_blocks);
-
-        // Block-max pruning: check each block's max score before decompressing.
-        // If block_max_score * query_weight < threshold, skip the entire block.
         for bi in block_idx..batch_end {
             let block_data = list.blocks.value(bi);
-            let block_max = read_block_max_score(block_data);
-
-            // Skip block if its max possible contribution is below the threshold
-            if block_skip_threshold > 0.0 && block_max * query_weight < block_skip_threshold {
-                blocks_skipped += 1;
-                continue;
-            }
-
             let remainder = length % BLOCK_SIZE;
             if bi + 1 == num_blocks && remainder != 0 {
                 decompress_posting_remainder(
@@ -516,7 +489,7 @@ fn process_compressed_list_with_lut(
         block_idx = batch_end;
     }
 
-    (processed, blocks_skipped)
+    processed
 }
 
 #[cfg(test)]
