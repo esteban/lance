@@ -71,7 +71,8 @@ pub struct IndexBM25Scorer<'a> {
     partitions: Vec<&'a InvertedPartition>,
     num_docs: usize,
     total_tokens: u64,
-    avg_doc_length: f32,
+    // Precomputed: B / avg_doc_length (avoids division in hot loop)
+    b_over_avgdl: f32,
 }
 
 impl<'a> IndexBM25Scorer<'a> {
@@ -87,7 +88,7 @@ impl<'a> IndexBM25Scorer<'a> {
             partitions,
             num_docs,
             total_tokens,
-            avg_doc_length: avgdl,
+            b_over_avgdl: B / avgdl,
         }
     }
 
@@ -125,7 +126,8 @@ impl Scorer for IndexBM25Scorer<'_> {
     fn doc_weight(&self, freq: u32, doc_tokens: u32) -> f32 {
         let freq = freq as f32;
         let doc_tokens = doc_tokens as f32;
-        let doc_norm = K1 * (1.0 - B + B * doc_tokens / self.avg_doc_length);
+        // Use precomputed b_over_avgdl to replace division with multiplication
+        let doc_norm = K1 * (1.0 - B + self.b_over_avgdl * doc_tokens);
         (K1 + 1.0) * freq / (freq + doc_norm)
     }
 }

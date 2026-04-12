@@ -522,42 +522,60 @@ impl InvertedIndex {
                 }
             })
             .collect::<Vec<_>>();
+        let single_partition = self.partitions.len() == 1;
         let mut parts = stream::iter(parts).buffer_unordered(get_num_compute_intensive_cpus());
-        let scorer = IndexBM25Scorer::new(self.partitions.iter().map(|part| part.as_ref()));
-        let mut idf_cache: HashMap<String, f32> = HashMap::new();
-        while let Some(res) = parts.try_next().await? {
-            if res.candidates.is_empty() {
-                continue;
-            }
-            let mut idf_by_position = Vec::with_capacity(res.tokens_by_position.len());
-            for token in &res.tokens_by_position {
-                let idf_weight = match idf_cache.get(token) {
-                    Some(weight) => *weight,
-                    None => {
-                        let weight = scorer.query_weight(token);
-                        idf_cache.insert(token.clone(), weight);
-                        weight
+
+        if single_partition {
+            // Fast path: single partition means partition-local IDF == global IDF.
+            // Use pre-computed scores from WAND directly, skip re-scoring.
+            while let Some(res) = parts.try_next().await? {
+                for doc in res.candidates {
+                    if candidates.len() < limit {
+                        candidates.push(Reverse(ScoredDoc::new(doc.row_id, doc.score)));
+                    } else if candidates.peek().unwrap().0.score.0 < doc.score {
+                        candidates.pop();
+                        candidates.push(Reverse(ScoredDoc::new(doc.row_id, doc.score)));
                     }
-                };
-                idf_by_position.push(idf_weight);
-            }
-            for DocCandidate {
-                row_id,
-                freqs,
-                doc_length,
-            } in res.candidates
-            {
-                let mut score = 0.0;
-                for (term_index, freq) in freqs.into_iter() {
-                    debug_assert!((term_index as usize) < idf_by_position.len());
-                    score +=
-                        idf_by_position[term_index as usize] * scorer.doc_weight(freq, doc_length);
                 }
-                if candidates.len() < limit {
-                    candidates.push(Reverse(ScoredDoc::new(row_id, score)));
-                } else if candidates.peek().unwrap().0.score.0 < score {
-                    candidates.pop();
-                    candidates.push(Reverse(ScoredDoc::new(row_id, score)));
+            }
+        } else {
+            let scorer = IndexBM25Scorer::new(self.partitions.iter().map(|part| part.as_ref()));
+            let mut idf_cache: HashMap<String, f32> = HashMap::new();
+            while let Some(res) = parts.try_next().await? {
+                if res.candidates.is_empty() {
+                    continue;
+                }
+                let mut idf_by_position = Vec::with_capacity(res.tokens_by_position.len());
+                for token in &res.tokens_by_position {
+                    let idf_weight = match idf_cache.get(token) {
+                        Some(weight) => *weight,
+                        None => {
+                            let weight = scorer.query_weight(token);
+                            idf_cache.insert(token.clone(), weight);
+                            weight
+                        }
+                    };
+                    idf_by_position.push(idf_weight);
+                }
+                for DocCandidate {
+                    row_id,
+                    freqs,
+                    doc_length,
+                    score: _,
+                } in res.candidates
+                {
+                    let mut score = 0.0;
+                    for (term_index, freq) in freqs.into_iter() {
+                        debug_assert!((term_index as usize) < idf_by_position.len());
+                        score += idf_by_position[term_index as usize]
+                            * scorer.doc_weight(freq, doc_length);
+                    }
+                    if candidates.len() < limit {
+                        candidates.push(Reverse(ScoredDoc::new(row_id, score)));
+                    } else if candidates.peek().unwrap().0.score.0 < score {
+                        candidates.pop();
+                        candidates.push(Reverse(ScoredDoc::new(row_id, score)));
+                    }
                 }
             }
         }

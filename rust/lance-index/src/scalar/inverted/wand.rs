@@ -6,6 +6,8 @@ use std::sync::{Arc, LazyLock};
 use std::{cell::UnsafeCell, collections::BinaryHeap};
 use std::{cmp::Reverse, fmt::Debug};
 
+use smallvec::SmallVec;
+
 use arrow::array::AsArray;
 use arrow::datatypes::Int32Type;
 use arrow_array::Array;
@@ -53,6 +55,10 @@ pub struct PostingIterator {
     // the index of current block, this can be changed by `next() and shallow_next()`
     block_idx: usize,
     approximate_upper_bound: f32,
+
+    // Cached current doc info to avoid repeated decompression lookups.
+    // Updated by `next()` and construction; read by `doc()` and comparisons.
+    cached_doc: Option<DocInfo>,
 
     // for compressed posting list
     compressed: Option<UnsafeCell<CompressedState>>,
@@ -220,7 +226,7 @@ impl PostingIterator {
 
         let is_compressed = matches!(list, PostingList::Compressed(_));
 
-        Self {
+        let mut iter = Self {
             token,
             token_id,
             position,
@@ -229,8 +235,11 @@ impl PostingIterator {
             index: 0,
             block_idx: 0,
             approximate_upper_bound,
+            cached_doc: None,
             compressed: is_compressed.then(|| UnsafeCell::new(CompressedState::new())),
-        }
+        };
+        iter.refresh_cached_doc();
+        iter
     }
 
     #[inline]
@@ -265,24 +274,29 @@ impl PostingIterator {
 
     #[inline]
     fn doc(&self) -> Option<DocInfo> {
+        self.cached_doc
+    }
+
+    /// Recompute and cache the current doc info from the posting list.
+    /// Must be called after any mutation of `self.index`.
+    #[inline]
+    fn refresh_cached_doc(&mut self) {
         if self.empty() {
-            return None;
+            self.cached_doc = None;
+            return;
         }
 
-        match self.list {
+        self.cached_doc = Some(match self.list {
             PostingList::Compressed(ref list) => {
                 let block_idx = self.index / BLOCK_SIZE;
                 let block_offset = self.index % BLOCK_SIZE;
                 let compressed = unsafe { &mut *self.ensure_compressed_block_ptr(list, block_idx) };
-
-                // Read from the decompressed block
                 let doc_id = compressed.doc_ids[block_offset];
                 let frequency = compressed.freqs[block_offset];
-                let doc = DocInfo::Raw(RawDocInfo { doc_id, frequency });
-                Some(doc)
+                DocInfo::Raw(RawDocInfo { doc_id, frequency })
             }
-            PostingList::Plain(ref list) => Some(DocInfo::Located(list.doc(self.index))),
-        }
+            PostingList::Plain(ref list) => DocInfo::Located(list.doc(self.index)),
+        });
     }
 
     fn position_cursor(&self) -> Option<PositionCursor<'_>> {
@@ -383,6 +397,7 @@ impl PostingIterator {
                 self.index += list.row_ids[self.index..].partition_point(|&id| id < least_id);
             }
         }
+        self.refresh_cached_doc();
     }
 
     fn shallow_next(&mut self, least_id: u64) {
@@ -434,11 +449,17 @@ impl PostingIterator {
     }
 }
 
+/// Inline capacity for term frequencies per candidate.
+/// 16 terms covers most queries without heap allocation.
+pub type TermFreqVec = SmallVec<[(u32, u32); 16]>;
+
 #[derive(Debug)]
 pub struct DocCandidate {
     pub row_id: u64,
+    /// BM25 score computed during WAND traversal (partition-local IDF).
+    pub score: f32,
     /// (term_index, freq)
-    pub freqs: Vec<(u32, u32)>,
+    pub freqs: TermFreqVec,
     pub doc_length: u32,
 }
 
@@ -447,18 +468,25 @@ struct HeadPosting {
     // The heap is ordered by smallest doc id so the top element determines
     // the next target doc to consider.
     posting: Box<PostingIterator>,
+    // Cached doc id to avoid pointer chase through Box on every heap comparison.
+    cached_doc_id: u64,
 }
 
 impl HeadPosting {
     fn new(posting: Box<PostingIterator>) -> Self {
-        Self { posting }
-    }
-
-    fn doc_id(&self) -> u64 {
-        self.posting
+        let cached_doc_id = posting
             .doc()
             .map(|doc| doc.doc_id())
-            .unwrap_or(TERMINATED_DOC_ID)
+            .unwrap_or(TERMINATED_DOC_ID);
+        Self {
+            posting,
+            cached_doc_id,
+        }
+    }
+
+    #[inline]
+    fn doc_id(&self) -> u64 {
+        self.cached_doc_id
     }
 }
 
@@ -711,6 +739,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
             .into_iter()
             .map(|Reverse((doc, freqs, doc_length))| DocCandidate {
                 row_id: doc.row_id,
+                score: doc.score.0,
                 freqs,
                 doc_length,
             })
@@ -816,6 +845,7 @@ impl<'a, S: Scorer> Wand<'a, S> {
             .into_iter()
             .map(|Reverse((doc, freqs, doc_length))| DocCandidate {
                 row_id: doc.row_id,
+                score: doc.score.0,
                 freqs,
                 doc_length,
             })
