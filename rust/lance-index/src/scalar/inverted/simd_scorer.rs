@@ -28,7 +28,75 @@ use crate::scalar::inverted::wand::{DocCandidate, PostingIterator, TermFreqVec};
 /// Number of blocks to decode in a single batch.
 /// 4 blocks × 128 docs = 512 docs per batch — fits in L1 cache.
 const DECODE_BATCH: usize = 4;
+#[allow(dead_code)]
 const DECODE_BATCH_DOCS: usize = DECODE_BATCH * BLOCK_SIZE;
+
+/// Maximum frequency value for the lookup table.
+/// Frequencies above this fall back to direct computation.
+const MAX_FREQ_LUT: usize = 64;
+
+/// Precomputed BM25 tf-score lookup table.
+/// For each (freq, doc_norm_bucket) pair, stores: (K1+1) * freq / (freq + norm)
+/// This replaces the f32 division in the scoring hot loop with a table lookup.
+struct ScoreLookupTable {
+    /// Table layout: [freq][norm_bucket] → tf_score
+    /// norm_bucket = (doc_norm * NORM_SCALE) as usize, clamped to [0, NUM_NORM_BUCKETS)
+    table: Vec<f32>,
+    norm_scale: f32,
+    num_norm_buckets: usize,
+}
+
+const NUM_NORM_BUCKETS: usize = 256;
+
+impl ScoreLookupTable {
+    fn new(doc_norms: &PrecomputedDocNorms) -> Self {
+        // Find the range of doc_norms to set bucket boundaries
+        let max_norm = doc_norms.norms.iter().copied().fold(0.0f32, f32::max);
+        let min_norm = doc_norms
+            .norms
+            .iter()
+            .copied()
+            .fold(f32::MAX, f32::min);
+        let norm_range = (max_norm - min_norm).max(0.001);
+        let norm_scale = (NUM_NORM_BUCKETS - 1) as f32 / norm_range;
+
+        let mut table = vec![0.0f32; MAX_FREQ_LUT * NUM_NORM_BUCKETS];
+        let k1_plus_1 = K1 + 1.0;
+        for freq in 0..MAX_FREQ_LUT {
+            let f = freq as f32;
+            for bucket in 0..NUM_NORM_BUCKETS {
+                let norm = min_norm + (bucket as f32) / norm_scale;
+                table[freq * NUM_NORM_BUCKETS + bucket] = k1_plus_1 * f / (f + norm);
+            }
+        }
+
+        Self {
+            table,
+            norm_scale,
+            num_norm_buckets: NUM_NORM_BUCKETS,
+        }
+    }
+
+    /// Look up the tf-score for a given frequency and doc_norm.
+    /// Returns query_weight * tf_score.
+    #[inline(always)]
+    fn score(&self, freq: u32, doc_norm: f32, query_weight: f32) -> f32 {
+        if (freq as usize) < MAX_FREQ_LUT {
+            let bucket =
+                ((doc_norm * self.norm_scale) as usize).min(self.num_norm_buckets - 1);
+            let tf = unsafe {
+                *self
+                    .table
+                    .get_unchecked(freq as usize * self.num_norm_buckets + bucket)
+            };
+            query_weight * tf
+        } else {
+            // Fallback for high frequencies
+            let f = freq as f32;
+            query_weight * (K1 + 1.0) * f / (f + doc_norm)
+        }
+    }
+}
 
 /// Precomputed BM25 document normalization factors.
 /// doc_norm[i] = K1 * (1 - B + B * doc_length[i] / avg_doc_length)
@@ -262,7 +330,12 @@ impl DecodeBuffer {
     }
 }
 
-/// Score-at-a-Time BM25 search with SIMD batch scoring.
+/// Score-at-a-Time BM25 search with all optimizations combined:
+/// - Precomputed doc_norms + score lookup table (zero f32 division)
+/// - u16 quantized accumulators (2x cache density)
+/// - Anytime termination (postings budget)
+/// - Term-level early exit (skip terms < 5% of threshold)
+/// - Multi-block decode + 8-wide scoring loops
 pub fn saat_bm25_search(
     postings: &[PostingIterator],
     docs: &DocSet,
@@ -276,13 +349,10 @@ pub fn saat_bm25_search(
     }
 
     let num_docs = docs.len();
-
-    // Precompute doc_norm for ALL documents once.
-    // This eliminates N_terms * N_docs_per_term redundant computations.
     let doc_norms = PrecomputedDocNorms::new(docs);
+    let lut = ScoreLookupTable::new(&doc_norms);
 
-    // Sort terms by query_weight descending (rarest first).
-    // query_weight already contains IDF from load_posting_lists.
+    // Sort terms by query_weight descending (rarest first)
     let mut term_order: Vec<(usize, f32)> = postings
         .iter()
         .enumerate()
@@ -291,49 +361,69 @@ pub fn saat_bm25_search(
         .collect();
     term_order.sort_by(|a, b| b.1.total_cmp(&a.1));
 
-    // Precompute remaining max score suffix sums for block pruning.
+    // Remaining max score suffix sums for early exit
     let mut remaining_max = vec![0.0f32; term_order.len() + 1];
     for i in (0..term_order.len()).rev() {
         remaining_max[i] = remaining_max[i + 1] + term_order[i].1 * (K1 + 1.0);
     }
 
-    // max_possible_score = sum of all terms' max contributions (used for u16 scaling)
-    let max_possible_score = remaining_max[0]; // sum of all qw * (K1+1)
+    let max_possible_score = remaining_max[0];
     let mut accumulator = ScoreAccumulator::new(num_docs, max_possible_score);
     let mut buffer = DecodeBuffer::new();
     let mut num_comparisons = 0usize;
 
-    // Process each term (sorted by IDF descending — rarest first)
-    for &(posting_idx, query_weight) in &term_order {
+    // Anytime postings budget: adaptive to query complexity.
+    // For top-10 with 10 terms, 200K postings ≈ 20K per term on average.
+    let postings_budget = (20 * limit * term_order.len()).max(100_000);
+    let mut postings_remaining = postings_budget;
+    let mut threshold = 0.0f32;
+
+    for (term_idx, &(posting_idx, query_weight)) in term_order.iter().enumerate() {
+        // Term-level early exit
+        if threshold > 0.0 && remaining_max[term_idx] < threshold * 0.05 {
+            break;
+        }
+        if postings_remaining == 0 {
+            break;
+        }
+
         let posting = &postings[posting_idx];
-        let qw_k1p1 = query_weight * (K1 + 1.0);
 
         match &posting.list {
             PostingList::Compressed(list) => {
-                process_compressed_list(
+                let processed = process_compressed_list_with_lut(
                     list,
-                    qw_k1p1,
+                    query_weight,
                     &doc_norms,
+                    &lut,
                     &mut accumulator,
                     &mut buffer,
-                    &mut num_comparisons,
+                    postings_remaining,
                 );
+                num_comparisons += processed;
+                postings_remaining = postings_remaining.saturating_sub(processed);
             }
             PostingList::Plain(list) => {
                 let scale = accumulator.scale;
-                for i in 0..list.row_ids.len() {
+                let to_process = list.row_ids.len().min(postings_remaining);
+                for i in 0..to_process {
                     let row_id = list.row_ids[i] as u32;
-                    let freq = list.frequencies[i] as f32;
+                    let freq = list.frequencies[i] as u32;
                     let doc_norm = doc_norms.get(row_id);
-                    let score = qw_k1p1 * freq / (freq + doc_norm);
+                    let score = lut.score(freq, doc_norm, query_weight * (K1 + 1.0));
                     let quantized = (score * scale) as u16;
                     let idx = row_id as usize;
                     accumulator.scores[idx] = accumulator.scores[idx].saturating_add(quantized);
-                    let word_idx = (row_id >> 6) as usize;
-                    accumulator.touched_bits[word_idx] |= 1u64 << (row_id & 63);
-                    num_comparisons += 1;
+                    accumulator.touched_bits[(row_id >> 6) as usize] |= 1u64 << (row_id & 63);
                 }
+                num_comparisons += to_process;
+                postings_remaining = postings_remaining.saturating_sub(to_process);
             }
+        }
+
+        // Update threshold for term-level early exit
+        if term_idx >= 2 && term_idx % 2 == 0 {
+            threshold = compute_threshold_fast(&accumulator, limit);
         }
     }
 
@@ -543,6 +633,83 @@ fn process_compressed_list_pruned(
 
         block_idx = batch_end;
     }
+}
+
+/// Process a compressed posting list with LUT scoring and postings budget.
+/// Returns the number of postings processed.
+fn process_compressed_list_with_lut(
+    list: &CompressedPostingList,
+    query_weight: f32,
+    doc_norms: &PrecomputedDocNorms,
+    lut: &ScoreLookupTable,
+    accumulator: &mut ScoreAccumulator,
+    buffer: &mut DecodeBuffer,
+    postings_budget: usize,
+) -> usize {
+    let num_blocks = list.blocks.len();
+    let length = list.length as usize;
+    let scale = accumulator.scale;
+    let mut processed = 0usize;
+
+    let mut block_idx = 0;
+    while block_idx < num_blocks && processed < postings_budget {
+        buffer.clear();
+
+        let batch_end = (block_idx + DECODE_BATCH).min(num_blocks);
+        for bi in block_idx..batch_end {
+            let block_data = list.blocks.value(bi);
+            let remainder = length % BLOCK_SIZE;
+            if bi + 1 == num_blocks && remainder != 0 {
+                decompress_posting_remainder(
+                    block_data, remainder, list.posting_tail_codec,
+                    &mut buffer.doc_ids, &mut buffer.freqs,
+                );
+            } else {
+                decompress_posting_block(
+                    block_data, &mut buffer.scratch,
+                    &mut buffer.doc_ids, &mut buffer.freqs,
+                );
+            }
+        }
+
+        // Score using LUT — replaces f32 division with table lookup
+        let len = buffer.doc_ids.len().min(postings_budget - processed);
+        let chunks = len / 8;
+        for chunk in 0..chunks {
+            let base = chunk * 8;
+            for i in 0..8 {
+                let idx = base + i;
+                let doc_id = unsafe { *buffer.doc_ids.get_unchecked(idx) };
+                let freq = unsafe { *buffer.freqs.get_unchecked(idx) };
+                let doc_norm = doc_norms.get(doc_id);
+                let score = lut.score(freq, doc_norm, query_weight);
+                let quantized = (score * scale) as u16;
+
+                let score_idx = doc_id as usize;
+                unsafe {
+                    let current = *accumulator.scores.get_unchecked(score_idx);
+                    *accumulator.scores.get_unchecked_mut(score_idx) = current.saturating_add(quantized);
+                    *accumulator.touched_bits.get_unchecked_mut((doc_id >> 6) as usize) |=
+                        1u64 << (doc_id & 63);
+                }
+            }
+        }
+        for idx in (chunks * 8)..len {
+            let doc_id = buffer.doc_ids[idx];
+            let freq = buffer.freqs[idx];
+            let doc_norm = doc_norms.get(doc_id);
+            let score = lut.score(freq, doc_norm, query_weight);
+            let quantized = (score * scale) as u16;
+            accumulator.scores[doc_id as usize] =
+                accumulator.scores[doc_id as usize].saturating_add(quantized);
+            accumulator.touched_bits[(doc_id >> 6) as usize] |= 1u64 << (doc_id & 63);
+        }
+
+        processed += len;
+        block_idx = batch_end;
+    }
+
+    processed
 }
 
 /// Process a compressed posting list: multi-block decode + batch scoring.

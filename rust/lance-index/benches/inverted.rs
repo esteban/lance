@@ -235,7 +235,7 @@ fn bench_inverted(c: &mut Criterion) {
         );
     }
 
-    // SAAT SIMD search benchmark
+    // SAAT SIMD search benchmark — default config
     let mut saat_query_idx = 0usize;
     c.bench_function(format!("invert_search_saat({TOTAL})").as_str(), |b| {
         b.to_async(&rt).iter(|| {
