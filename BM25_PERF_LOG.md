@@ -136,7 +136,23 @@ Implemented Score-at-a-Time (SAAT) alternative search path with:
 | Path | Time | Per-Doc Cost | Docs Processed | Notes |
 |------|------|-------------|----------------|-------|
 | WAND (baseline) | 5.32 ms | 73 ns | ~73K | Block-max pruning effective |
-| SAAT batch | 11.3 ms | 23 ns | ~500K | 3x faster per doc, 7x more data |
+| SAAT v1 (initial) | 11.3 ms | 23 ns | ~500K | No norms precompute, Vec touch |
+| SAAT v2 (optimized) | 7.44 ms | 15 ns | ~500K | Precomputed norms, bitset, unsafe |
+| SAAT parallel (rayon) | 7.12 ms | -- | ~500K | Merge phase (40MB) limits gains |
+| SAAT + block pruning | 7.79 ms | -- | ~500K | Pruning overhead > benefit |
+
+### SAAT Optimization History
+
+| Optimization | Impact | Notes |
+|-------------|--------|-------|
+| Precomputed doc_norm array | -34% | Eliminates N_terms redundant computations |
+| Bitset instead of Vec for touch tracking | -5% | Branchless, no allocation pressure |
+| unsafe get_unchecked in hot loop | -3% | Eliminate bounds checks |
+| Multi-block decode (4 blocks/batch) | -2% | Better L1 cache utilization |
+| Software prefetch of doc_norms | -1% | Hardware prefetcher already good |
+| Block-level pruning | +4% (worse) | Overhead exceeds pruning benefit |
+| Parallel rayon term processing | +5% (worse) | 10x4MB merge dominates |
+| Two-phase threshold + pruned path | +5% (worse) | threshold_fast scan too expensive |
 
 **Finding**: SAAT's 3x per-doc advantage from batch scoring is negated by processing
 7x more data (full union of posting lists vs WAND's pruned candidates).
