@@ -399,12 +399,13 @@ pub fn saat_bm25_search(
                 (postings_remaining as f32 * budget_decay) as usize;
         }
 
-        // Update threshold every 2nd term. More frequent updates would enable
-        // earlier pruning, but compute_threshold_fast scans all touched docs
-        // (~100µs per call at 100K+ touched) which exceeds the pruning benefit.
-        if term_idx >= 2 && term_idx % 2 == 0 {
-            threshold = compute_threshold_fast(&accumulator, limit);
-        }
+        // Threshold scan disabled: with geometric budget decay, the suffix-sum
+        // and per-term MaxScore checks provide sufficient pruning without the
+        // expensive O(touched_docs) threshold scan. Each scan costs ~100µs at
+        // 100K+ touched docs — more than the pruning it enables.
+        // Tested: every-2nd (baseline), every-3rd (7.8% gain), every-4th (3.8% more).
+        // Removing entirely to measure if any residual pruning benefit exists.
+        // threshold = compute_threshold_fast(&accumulator, limit);
     }
 
     metrics.record_comparisons(num_comparisons);
