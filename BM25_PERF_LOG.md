@@ -103,15 +103,12 @@ To achieve 100x (5ms -> 50us), need fundamentally different approaches:
 4. **SIMD batch scoring**: Process 8 docs simultaneously using AVX2
 5. **Tiered index**: Pre-cluster docs by quality, search high-quality tier first
 
-## Current State
+## Current State (corpus-wide queries)
 
-| Path | Time | vs Baseline | Notes |
-|------|------|-------------|-------|
-| Baseline WAND | 7.17 ms | 1.00x | Original |
-| Optimized WAND | 5.32 ms | 1.35x | Phase 2 Rust-level opts |
-| SAAT (all opts) | **776 µs** | **9.2x** | LUT + u16 + anytime ρ=50K |
-| SAAT (ρ=100K) | **1.03 ms** | **6.9x** | 1M-doc benchmark timing; 89.2% recall@10 on separate corpus-wide validation |
-| SAAT (ρ=50K) | **776 µs** | **9.2x** | 1M-doc benchmark timing; 79.0% recall@10 on separate corpus-wide validation |
+| Path | Time | vs WAND | Recall@10 | Notes |
+|------|------|---------|-----------|-------|
+| WAND (exact) | 6.89 ms | 1.0x | 100% | Baseline with corpus-wide queries |
+| **SAAT (ρ=100K)** | **1.24 ms** | **5.6x** | **89.2%** | Production default |
 
 ### Codex Review Notes (2026-04-12) — RESOLVED
 
@@ -120,23 +117,17 @@ Author: Codex | Resolution: Claude Opus 4.6
 1. **Single-partition**: Confirmed. Multi-partition falls back to exact WAND. SAAT latency is single-partition only. **RESOLVED**.
 2. **Query sampling bias**: Fixed. Integration test now samples tokens from random documents across the entire corpus (not just doc 0). Recall dropped from 95.2% to 89.2% at ρ=100K, confirming the bias existed. **RESOLVED**.
 3. **Recall threshold**: Tightened from 70% to 85%. Measured 89.2% at ρ=100K over 200 corpus-wide queries. **RESOLVED**.
-4. **Representative validation**: Recall is now validated on 200 queries with 3-15 tokens sampled from random docs. Latency rows below still come from the benchmark harness on the 1M-doc benchmark workload, so treat them as benchmark timings rather than corpus-wide latency measurements. **PARTIALLY RESOLVED**.
+4. **Representative validation**: Done. Benchmark now uses corpus-wide query sampling (each token from a random doc). Both latency and recall use the same methodology. **RESOLVED**.
 
-### Validated Recall vs Budget (corpus-wide, 200 queries, 100K docs)
+### Validated Results (corpus-wide queries, 1M docs benchmark / 100K docs recall test)
 
-| Budget (ρ) | Recall@10 |
-|-----------|-----------|
-| 50,000 | 79.0% |
-| 100,000 | 89.2% |
-| 200,000 | 92.5% |
+| Budget (ρ) | Recall@10 | Latency (ms) | vs WAND (6.89ms) |
+|-----------|-----------|-------------|-------------------|
+| 50,000 | 79.0% | -- | -- |
+| 100,000 | 89.2% | 1.24 | 5.6x |
+| 200,000 | 92.5% | -- | -- |
 
-### Reference Benchmark Timing by Budget (1M docs, doc-0 query pool)
-
-| Budget (ρ) | Latency (ms) | vs Baseline |
-|-----------|-------------|-------------|
-| 50,000 | 0.78 | 9.2x |
-| 100,000 | 1.03 | 6.9x |
-| 200,000 | 2.17 | 3.3x |
+WAND (exact, corpus-wide): 6.89ms
 
 ### Progression of SAAT Optimization (branch: perf/bm25-simd-format)
 

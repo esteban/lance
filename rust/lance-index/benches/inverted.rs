@@ -151,16 +151,10 @@ fn bench_inverted(c: &mut Criterion) {
     let params = FtsSearchParams::new().with_limit(Some(10));
     let no_filter = Arc::new(NoFilter);
 
-    // Get some sample words from the generated documents for search
-    // Query tokens are sampled from doc 0 here for benchmark reproducibility/speed.
-    // Correctness across the full corpus is validated by the integration test
-    // test_saat_vs_wand_correctness, which samples from random documents.
-    let sample_doc = doc_col.value(0);
-    let sample_words: Vec<String> = sample_doc
-        .split_whitespace()
-        .map(|s| s.to_owned())
-        .collect();
-    let sample_words_len = sample_words.len();
+    // Sample query tokens from random documents across the entire corpus.
+    // Each token is drawn from a different random document to avoid
+    // first-document bias that overstates rare-term selectivity.
+    // This matches the methodology in test_saat_vs_wand_correctness.
     const TOKENS_PER_QUERY: usize = 15;
     const QUERY_SET_SIZE: usize = 1024;
     let mut query_rng = StdRng::seed_from_u64(7);
@@ -168,8 +162,14 @@ fn bench_inverted(c: &mut Criterion) {
     for _ in 0..QUERY_SET_SIZE {
         let mut query_tokens = Vec::with_capacity(TOKENS_PER_QUERY);
         for _ in 0..TOKENS_PER_QUERY {
-            let word_idx = query_rng.random_range(0..sample_words_len);
-            query_tokens.push(sample_words[word_idx].clone());
+            let doc_idx = query_rng.random_range(0..TOTAL);
+            let doc_text = doc_col.value(doc_idx);
+            let words: Vec<&str> = doc_text.split_whitespace().collect();
+            if words.is_empty() {
+                continue;
+            }
+            let word_idx = query_rng.random_range(0..words.len());
+            query_tokens.push(words[word_idx].to_owned());
         }
         queries.push(Arc::new(Tokens::new(query_tokens, DocType::Text)));
     }
@@ -267,15 +267,22 @@ fn bench_inverted(c: &mut Criterion) {
     let phrase_params = FtsSearchParams::new()
         .with_limit(Some(10))
         .with_phrase_slop(Some(0));
-    let phrase_pairs = sample_words
-        .windows(2)
-        .map(|pair| {
-            Arc::new(Tokens::new(
-                pair.iter().map(|s| s.to_string()).collect(),
-                DocType::Text,
-            ))
-        })
-        .collect_vec();
+    // Generate phrase queries from adjacent words in random documents
+    let mut phrase_rng = StdRng::seed_from_u64(13);
+    let mut phrase_pairs = Vec::with_capacity(256);
+    while phrase_pairs.len() < 256 {
+        let doc_idx = phrase_rng.random_range(0..TOTAL);
+        let doc_text = doc_col.value(doc_idx);
+        let words: Vec<&str> = doc_text.split_whitespace().collect();
+        if words.len() < 2 {
+            continue;
+        }
+        let start = phrase_rng.random_range(0..words.len() - 1);
+        phrase_pairs.push(Arc::new(Tokens::new(
+            vec![words[start].to_owned(), words[start + 1].to_owned()],
+            DocType::Text,
+        )));
+    }
     let mut phrase_query_idx = 0usize;
 
     c.bench_function(format!("invert_phrase_search({TOTAL})").as_str(), |b| {
