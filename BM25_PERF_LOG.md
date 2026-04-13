@@ -265,3 +265,39 @@ The BM25 search pipeline in Lance uses **Block-Max WAND (BMW)** with:
 The WAND implementation at `rust/lance-index/src/scalar/inverted/wand.rs` (~1700 lines) is already
 well-optimized for its algorithmic class. The **73ns per-iteration cost** is near CPU-optimal
 for the heap + score + advance operations at query term counts of 10-15.
+
+### Phase 6: Oracle-Based Bottleneck Decomposition (2026-04-12)
+
+Oracle experiments to isolate the true bottleneck at 986µs:
+
+| Oracle | What it measures | Time | Delta from baseline |
+|--------|-----------------|------|---------------------|
+| No scoring (decompress only) | Load + decompress floor | 621µs | -37% |
+| No decompression (score fake data) | Load + scoring | 765µs | -22% |
+| No num_tokens lookup (const bucket) | Scoring - random access | 961µs | -2.5% |
+| Full pipeline | Everything | 986µs | -- |
+
+True decomposition:
+
+| Component | Time | % | Optimizable? |
+|-----------|------|---|-------------|
+| Posting list load + LUT | 400µs | 41% | No (Arrow I/O structural) |
+| BitPacker decompression | 221µs | 22% | No (SIMD-optimized) |
+| Scoring + accumulator | 365µs | 37% | Marginal (2.5% ceiling from num_tokens) |
+
+**Key correction**: Previous cache-line analysis identified num_tokens[doc_id] (4MB)
+as the primary bottleneck. Oracle test proved this wrong — eliminating num_tokens
+entirely saves only 2.5%. The real bottleneck is the posting list load path (41%).
+
+Experiments tested and rejected:
+- TF=1 avg-length fast path: recall collapsed to 34.6%
+- 0-bit frequency skip: BitPacker at 0 bits already near-free
+- Inline per-block scoring: no change (both batch sizes fit L1)
+- Budget reduction to 75K: recall 83.6% (below 85%)
+- u8 doc_buckets cached at DocSet load: +3% regression
+- u8 doc_buckets per-query precompute: +8.5% regression
+
+**Conclusion**: The SAAT scorer at ~980µs has reached its performance floor for
+the current index format. Further gains require changes to the index format
+or the posting list load path (e.g., memory-mapped posting lists, preloaded
+block arrays, or a custom non-Arrow storage layer).
