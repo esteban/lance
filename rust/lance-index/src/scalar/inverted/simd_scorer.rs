@@ -32,12 +32,23 @@
 //! | quantized_lut | 32 KB | L1    | Random     | No         |
 //! | decode bufs   | 4 KB  | L1    | Sequential | No         |
 //!
-//! Primary bottleneck: num_tokens[doc_id] (4MB u32 array).
+//! ## Oracle-based bottleneck decomposition (986us total)
 //!
-//! TESTED and REJECTED: precomputed u8 doc_buckets array (1MB).
-//! - Per-query precompute: +8.5% regression (1.6ms build > 0.13ms savings).
-//! - Cached at DocSet load: +3% regression vs baseline. Loop is memory-latency-
-//!   bound; 4 saved FP insns hide behind L2 access. Extra 1MB adds cache pressure.
+//! | Component               | Time  | %   | Method                            |
+//! |-------------------------|-------|-----|-----------------------------------|
+//! | Posting list load + LUT | 400us | 41% | no-decompress - scoring delta     |
+//! | BitPacker decompression | 221us | 22% | no-scoring - no-decompress delta  |
+//! | Scoring + accumulator   | 365us | 37% | total - no-scoring oracle         |
+//!
+//! Previous analysis identified num_tokens as bottleneck, but oracle showed
+//! eliminating it saves only 2.5%. Actual bottleneck is posting list load
+//! (Arrow array access, term lookup, LUT construction).
+//!
+//! REJECTED experiments on scoring/decompression:
+//! - u8 doc_buckets: +8.5% (per-query) / +3% (cached at load)
+//! - TF=1 avg-length fast path: recall collapsed to 34.6%
+//! - 0-bit frequency skip: BitPacker at 0 bits already near-free
+//! - Inline per-block scoring: no change (both batch sizes fit L1)
 
 use std::sync::Arc;
 
